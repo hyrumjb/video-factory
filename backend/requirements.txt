@@ -4,3 +4,4 @@ openai>=1.54.0
 python-dotenv>=1.0.1
 pydantic>=2.10.0
 python-multipart>=0.0.12
+google-cloud-texttospeech>=2.16.0

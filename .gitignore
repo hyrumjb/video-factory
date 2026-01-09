@@ -15,3 +15,4 @@ frontend/build
 frontend/coverage
 frontend/logs
 frontend/temp
+google-credentials.json
