@@ -1,0 +1,17 @@
+.env
+.env.example
+.env.local
+node_modules
+.DS_Store
+backend/.env
+frontend/.env
+frontend/.env.local
+frontend/node_modules
+frontend/.DS_Store
+frontend/.next
+frontend/out
+frontend/dist
+frontend/build
+frontend/coverage
+frontend/logs
+frontend/temp
