@@ -7,13 +7,12 @@ import Header from './components/Header';
 export default function Home() {
   const [topic, setTopic] = useState('');
   const [placeholder, setPlaceholder] = useState('');
-  const [selectedVoice, setSelectedVoice] = useState('en-US-Neural2-H');
-  const [isTransitioning, setIsTransitioning] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState('en-AU-Neural2-A');
   const router = useRouter();
 
   const voices = [
-    { name: 'en-US-Neural2-H', label: 'Neural2-H (Female)', starred: false },
-    { name: 'en-US-Neural2-A', label: 'Neural2-A (Male)', starred: false },
+    { name: 'en-AU-Neural2-A', label: 'Female', starred: false },
+    { name: 'en-AU-Neural2-B', label: 'Male', starred: false },
   ];
 
   const placeholders = [
@@ -87,10 +86,7 @@ export default function Home() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!topic.trim() || isTransitioning) return;
-    
-    // Start transition animation
-    setIsTransitioning(true);
+    if (!topic.trim()) return;
     
     // Store topic and selected voice in sessionStorage
     if (typeof window !== 'undefined') {
@@ -98,18 +94,12 @@ export default function Home() {
       sessionStorage.setItem('selectedVoice', selectedVoice);
     }
     
-    // Wait for slide-up animation to complete before navigating
-    setTimeout(() => {
-      router.push('/results');
-    }, 400); // Match animation duration
+    // Navigate immediately without transition
+    router.push('/results');
   };
 
   return (
-    <div 
-      className={`min-h-screen bg-white flex flex-col items-center justify-center relative transition-transform duration-500 ease-in-out ${
-        isTransitioning ? '-translate-y-full opacity-0' : 'translate-y-0 opacity-100'
-      }`}
-    >
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center relative">
       <Header />
 
       {/* Main content */}
@@ -132,7 +122,7 @@ export default function Home() {
               <select
                 value={selectedVoice}
                 onChange={(e) => setSelectedVoice(e.target.value)}
-                className="px-3 py-2.5 bg-white text-gray-900 text-sm font-medium rounded-lg border border-gray-300 outline-none focus:ring-2 focus:ring-gray-400 focus:border-gray-400 transition-colors"
+                className="px-4 py-2.5 bg-white text-gray-900 text-sm font-medium rounded-lg border-0 outline-none focus:ring-2 focus:ring-gray-400 transition-colors"
                 style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
                 onClick={(e) => e.stopPropagation()}
               >
@@ -145,8 +135,8 @@ export default function Home() {
               <button
                 type="submit"
                 disabled={!topic.trim()}
-                className="px-5 py-2.5 bg-gray-900 text-white text-sm font-medium rounded-lg disabled:opacity-60 disabled:cursor-not-allowed transition-colors duration-200 hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2"
-                style={{ fontFamily: 'system-ui, -apple-system, sans-serif', boxShadow: '0px 2px 8px rgba(0, 0, 0, 0.15)' }}
+                className="px-6 py-2.5 bg-gray-900 text-white text-sm font-medium rounded-xl disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200 hover:bg-gray-800 hover:scale-105 active:scale-95 focus:outline-none focus:ring-2 focus:ring-gray-900/20"
+                style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
               >
                 Generate
               </button>

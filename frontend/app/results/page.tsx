@@ -27,14 +27,11 @@ function ResultsContent() {
   const [isSearchingVideos, setIsSearchingVideos] = useState(false);
   const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
   const [isCompilingVideo, setIsCompilingVideo] = useState(false);
-  const [isEntering, setIsEntering] = useState(true);
   const hasFetchedRef = useRef(false);
 
   useEffect(() => {
-    // Trigger slide-in animation on mount
-    setTimeout(() => {
-      setIsEntering(false);
-    }, 50); // Small delay to ensure initial state is rendered
+    // Prevent auto-scroll on page load
+    window.scrollTo(0, 0);
     
     // Only run once on mount
     if (hasFetchedRef.current) return;
@@ -334,11 +331,7 @@ function ResultsContent() {
   };
 
   return (
-    <div 
-      className={`min-h-screen bg-white flex flex-col items-center justify-center relative transition-transform duration-500 ease-in-out ${
-        isEntering ? 'translate-y-full opacity-0' : 'translate-y-0 opacity-100'
-      }`}
-    >
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center relative">
       <Header />
 
       {/* Main content */}
@@ -363,9 +356,10 @@ function ResultsContent() {
             </div>
           </div>
         ) : (
-          <div className="w-full grid grid-cols-1 md:grid-cols-3 md:grid-rows-4 gap-6">
-            {/* Script Box - 1x1 (top left) - Height calculated: (500px - 24px gap) / 2 = 238px */}
-            <div className="md:col-span-1 md:row-span-1">
+          <div className="w-full grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Left column: 4 boxes stacked vertically (1/3 width) */}
+            <div className="md:col-span-1 flex flex-col space-y-6">
+              {/* Script Box */}
               {renderContentBox(
                 'Script',
                 script ? (
@@ -373,12 +367,10 @@ function ResultsContent() {
                 ) : null,
                 isLoading,
                 !isLoading && !script,
-                '238px'
+                'auto'
               )}
-            </div>
 
-            {/* Audio Box - 1x1 (below script, still left column) - Height calculated: (500px - 24px gap) / 2 = 238px */}
-            <div className="md:col-span-1 md:row-span-1">
+              {/* Audio Box */}
               {renderContentBox(
                 'Audio',
                 audioUrl ? (
@@ -395,12 +387,10 @@ function ResultsContent() {
                 ) : null,
                 isGeneratingAudio,
                 !isLoading && !isGeneratingAudio && !audioUrl,
-                '238px'
+                'auto'
               )}
-            </div>
 
-            {/* Video Scenes Box - 2x2 (top right, spanning 2 columns and 2 rows) - Increased to 500px */}
-            <div className="md:col-span-2 md:row-span-2 md:col-start-2 md:row-start-1">
+              {/* Video Scenes Box */}
               {renderContentBox(
                 'Video Scenes',
                 scenes && scenes.length > 0 ? (
@@ -426,12 +416,10 @@ function ResultsContent() {
                 ) : null,
                 false,
                 !isLoading && (!scenes || scenes.length === 0),
-                '500px'
+                'auto'
               )}
-            </div>
 
-            {/* Stock Videos Box - 2x2 (bottom left, spanning 2 columns and 2 rows, below script/audio) - Same height as Final Video */}
-            <div className="md:col-span-2 md:row-span-2 md:col-start-1 md:row-start-3">
+              {/* Stock Videos Box */}
               {renderContentBox(
                 'Stock Videos',
                 videos && videos.length > 0 ? (
@@ -481,12 +469,12 @@ function ResultsContent() {
                 ) : null,
                 isSearchingVideos,
                 !isLoading && !isSearchingVideos && (!videos || videos.length === 0),
-                '500px'
+                'auto'
               )}
             </div>
 
-            {/* Final Video Box - 1x2 (bottom right, spanning 1 column and 2 rows) - Vertical video */}
-            <div className="md:col-span-1 md:row-span-2 md:col-start-3 md:row-start-3">
+            {/* Right column: Final Video Box (2/3 width) */}
+            <div className="md:col-span-2 flex flex-col">
               {renderContentBox(
                 'Final Video',
                 finalVideoUrl ? (
@@ -517,7 +505,7 @@ function ResultsContent() {
                 ),
                 isCompilingVideo,
                 !audioUrl || !videos || videos.length === 0,
-                '500px'
+                'auto'
               )}
             </div>
           </div>

@@ -15,6 +15,14 @@ from urllib.parse import quote_plus
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Import ASS subtitle functions from subtitles module
+try:
+    from subtitles import create_ass_from_timepoints, create_ass_fallback
+except ImportError:
+    # Fallback: these will be defined later in the file if module not available
+    create_ass_from_timepoints = None
+    create_ass_fallback = None
+
 # Get ffmpeg executable path from imageio-ffmpeg
 try:
     import imageio_ffmpeg
@@ -598,11 +606,24 @@ def generate_tts_with_timing(text: str, voice_name: str = "en-US-Neural2-H"):
         # Configure synthesis with timing enabled
         synthesis_input = texttospeech.SynthesisInput(ssml=ssml_text)
         
-        # Determine gender from voice name (F = female, others typically male)
-        ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+        # Extract language code from voice name and convert to lowercase (Google API requires lowercase)
+        language_code = "en-US"  # Default
+        if "-" in voice_name:
+            parts = voice_name.split("-")
+            if len(parts) >= 2:
+                language_code = f"{parts[0]}-{parts[1]}"
+        language_code_lower = language_code.lower()
+        
+        # Determine gender based on language code and voice ending
+        if language_code.upper() == "EN-GB":
+            ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") or voice_name.endswith("-F") or voice_name.endswith("-N") else texttospeech.SsmlVoiceGender.MALE
+        elif language_code.upper() == "EN-AU":
+            ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") else texttospeech.SsmlVoiceGender.MALE
+        else:  # American (en-US)
+            ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
         
         voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
+            language_code=language_code_lower,
             name=voice_name,
             ssml_gender=ssml_gender,
         )
@@ -645,10 +666,24 @@ def generate_tts_with_timing(text: str, voice_name: str = "en-US-Neural2-H"):
         # Fallback to simple TTS without timing
         try:
             synthesis_input = texttospeech.SynthesisInput(text=text)
-            # Determine gender from voice name
-            ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+            # Extract language code from voice name and convert to lowercase
+            language_code = "en-US"  # Default
+            if "-" in voice_name:
+                parts = voice_name.split("-")
+                if len(parts) >= 2:
+                    language_code = f"{parts[0]}-{parts[1]}"
+            language_code_lower = language_code.lower()
+            
+            # Determine gender based on language code and voice ending
+            if language_code.upper() == "EN-GB":
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") or voice_name.endswith("-F") or voice_name.endswith("-N") else texttospeech.SsmlVoiceGender.MALE
+            elif language_code.upper() == "EN-AU":
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") else texttospeech.SsmlVoiceGender.MALE
+            else:  # American (en-US)
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+            
             voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
+                language_code=language_code_lower,
                 name=voice_name,
                 ssml_gender=ssml_gender,
             )
@@ -686,10 +721,24 @@ async def generate_tts(request: TTSRequest):
             print(f"Warning: TTS with timing failed: {timing_error}, falling back to simple TTS")
             # Fallback to simple TTS without timing
             synthesis_input = texttospeech.SynthesisInput(text=request.text.strip())
-            # Use selected voice for fallback
-            ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+            # Extract language code from voice name and convert to lowercase
+            language_code = "en-US"  # Default
+            if "-" in voice_name:
+                parts = voice_name.split("-")
+                if len(parts) >= 2:
+                    language_code = f"{parts[0]}-{parts[1]}"
+            language_code_lower = language_code.lower()
+            
+            # Determine gender based on language code and voice ending
+            if language_code.upper() == "EN-GB":
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") or voice_name.endswith("-F") or voice_name.endswith("-N") else texttospeech.SsmlVoiceGender.MALE
+            elif language_code.upper() == "EN-AU":
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") else texttospeech.SsmlVoiceGender.MALE
+            else:  # American (en-US)
+                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+            
             voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
+                language_code=language_code_lower,
                 name=voice_name,
                 ssml_gender=ssml_gender,
             )
@@ -752,14 +801,27 @@ async def generate_tts_multi_voice(request: MultiVoiceTTSRequest):
             try:
                 print(f"🎤 Generating TTS with voice: {voice_name}")
                 
-                # Determine gender from voice name
-                ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
+                # Extract language code from voice name and convert to lowercase
+                language_code = "en-US"  # Default
+                if "-" in voice_name:
+                    parts = voice_name.split("-")
+                    if len(parts) >= 2:
+                        language_code = f"{parts[0]}-{parts[1]}"
+                language_code_lower = language_code.lower()
+                
+                # Determine gender based on language code and voice ending
+                if language_code.upper() == "EN-GB":
+                    ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") or voice_name.endswith("-F") or voice_name.endswith("-N") else texttospeech.SsmlVoiceGender.MALE
+                elif language_code.upper() == "EN-AU":
+                    ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-A") or voice_name.endswith("-C") else texttospeech.SsmlVoiceGender.MALE
+                else:  # American (en-US)
+                    ssml_gender = texttospeech.SsmlVoiceGender.FEMALE if voice_name.endswith("-F") or voice_name.endswith("-C") or voice_name.endswith("-E") or voice_name.endswith("-G") or voice_name.endswith("-H") else texttospeech.SsmlVoiceGender.MALE
                 gender_str = "Female" if ssml_gender == texttospeech.SsmlVoiceGender.FEMALE else "Male"
                 
                 # Generate TTS (without timing for faster generation in testing)
                 synthesis_input = texttospeech.SynthesisInput(text=request.text.strip())
                 voice = texttospeech.VoiceSelectionParams(
-                    language_code="en-US",
+                    language_code=language_code_lower,
                     name=voice_name,
                     ssml_gender=ssml_gender,
                 )
@@ -1482,7 +1544,8 @@ async def compile_video(request: CompileVideoRequest):
                     trimmed_videos.append(trimmed_path)
                     print(f"✓ Trimmed video {i+1} to {scene_duration:.2f}s")
                 except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                    # stderr is already a string when text=True is used
+                    error_msg = e.stderr if e.stderr else 'Unknown error'
                     print(f"✗ Failed to trim video {i+1}: {error_msg[:200]}")
                     raise HTTPException(status_code=500, detail=f"Failed to trim video {i+1} to {scene_duration:.2f}s")
             
@@ -1507,7 +1570,8 @@ async def compile_video(request: CompileVideoRequest):
                     result = subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
                     print(f"✓ Scaled single video to vertical format")
                 except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                    # stderr is already a string when text=True is used
+                    error_msg = e.stderr if e.stderr else 'Unknown error'
                     print(f"✗ Failed to scale video: {error_msg[:200]}")
                     raise HTTPException(status_code=500, detail="Failed to scale video")
             else:
@@ -1562,10 +1626,11 @@ async def compile_video(request: CompileVideoRequest):
                     if result.stderr:
                         print(f"   Concat stderr: {result.stderr[:500]}")
                 except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                    # stderr is already a string when text=True is used
+                    error_msg = e.stderr if e.stderr else 'Unknown error'
                     print(f"✗ FFmpeg concat error: {error_msg[:500]}")
                     if e.stdout:
-                        print(f"   FFmpeg stdout: {e.stdout.decode()[:500]}")
+                        print(f"   FFmpeg stdout: {e.stdout[:500]}")
                     raise HTTPException(status_code=500, detail="Failed to concatenate videos")
             
             # Step 2: Generate subtitles with timing from Google TTS
@@ -1583,28 +1648,50 @@ async def compile_video(request: CompileVideoRequest):
                     
                     if timepoints:
                         print(f"   Received {len(timepoints)} timepoints from TTS")
-                        # Create main subtitle file (5 words per caption)
+                        # Create professional ASS subtitle file with karaoke effects
                         # Use the EXACT same script_text that was used for TTS
-                        srt_content = create_srt_from_timepoints(script_text, timepoints, audio_duration, style="5words")
-                        subtitle_path = temp_path / "subtitles.srt"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(srt_content)
-                        print(f"✓ Created subtitle file (5 words per caption) with {len(timepoints)} timepoints")
+                        if create_ass_from_timepoints:
+                            ass_content = create_ass_from_timepoints(script_text, timepoints, audio_duration, style="3words")
+                            subtitle_path = temp_path / "subtitles.ass"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(ass_content)
+                            print(f"✓ Created professional ASS subtitle file (3 words max per line) with {len(timepoints)} timepoints")
+                        else:
+                            # Fallback to SRT if ASS functions not available
+                            srt_content = create_srt_from_timepoints(script_text, timepoints, audio_duration, style="3words")
+                            subtitle_path = temp_path / "subtitles.srt"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(srt_content)
+                            print(f"✓ Created SRT subtitle file (3 words per caption) with {len(timepoints)} timepoints")
                     else:
                         print(f"⚠ No timepoints received, creating estimated subtitles")
-                        # Fallback: create simple subtitles with even timing
-                        srt_content = create_srt_from_timepoints(script_text, [], audio_duration, style="5words")
-                        subtitle_path = temp_path / "subtitles.srt"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(srt_content)
+                        # Fallback: create simple ASS subtitles with even timing
+                        if create_ass_fallback:
+                            ass_content = create_ass_fallback(script_text, audio_duration)
+                            subtitle_path = temp_path / "subtitles.ass"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(ass_content)
+                        else:
+                            # Fallback to SRT if ASS functions not available
+                            srt_content = create_srt_fallback(script_text, audio_duration)
+                            subtitle_path = temp_path / "subtitles.srt"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(srt_content)
                 except Exception as e:
                     print(f"⚠ Failed to generate subtitles with timing: {e}")
                     # Fallback: create simple subtitles
                     try:
-                        srt_content = create_srt_from_timepoints(script_text, [], audio_duration, style="5words")
-                        subtitle_path = temp_path / "subtitles.srt"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(srt_content)
+                        if create_ass_fallback:
+                            ass_content = create_ass_fallback(script_text, audio_duration)
+                            subtitle_path = temp_path / "subtitles.ass"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(ass_content)
+                        else:
+                            # Fallback to SRT if ASS functions not available
+                            srt_content = create_srt_fallback(script_text, audio_duration)
+                            subtitle_path = temp_path / "subtitles.srt"
+                            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                                f.write(srt_content)
                     except:
                         subtitle_path = None
             
@@ -1649,10 +1736,19 @@ async def compile_video(request: CompileVideoRequest):
                 # Build video filter with subtitles
                 # Escape path for Windows compatibility
                 subtitle_path_escaped = str(subtitle_path).replace('\\', '/').replace(':', '\\:')
-                # Style: Fixed positioning to keep captions at consistent location
-                # MarginV=40 adds bottom margin (fixed position), MarginL and MarginR add side margins
-                # Alignment=2 centers text, which keeps it in the same horizontal position
-                video_filter = f"subtitles='{subtitle_path_escaped}':force_style='FontSize=20,PrimaryColour=&Hffffff,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2,MarginV=40,MarginL=20,MarginR=20'"
+                
+                # Use appropriate filter based on subtitle format
+                if subtitle_path.suffix == '.ass':
+                    # Use ass= filter for ASS format (supports karaoke \k tags and professional styling)
+                    # Escape single quotes in path for shell safety
+                    subtitle_path_escaped_quotes = subtitle_path_escaped.replace("'", "'\\''")
+                    video_filter = f"ass='{subtitle_path_escaped_quotes}'"
+                    print(f"   Using ASS filter with path: {subtitle_path}")
+                    print(f"   Filter command: {video_filter}")
+                else:
+                    # Use subtitles= filter for SRT format
+                    subtitle_path_escaped_quotes = subtitle_path_escaped.replace("'", "'\\''")
+                    video_filter = f"subtitles='{subtitle_path_escaped_quotes}'"
                 final_cmd = [
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(concat_video_path),
@@ -1660,14 +1756,26 @@ async def compile_video(request: CompileVideoRequest):
                     '-vf', video_filter,
                     '-c:v', 'libx264',
                     '-preset', 'fast',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',
+                    '-pix_fmt', 'yuv420p',  # Ensure TikTok-compatible color format
+                    '-colorspace', 'bt709',  # Standard color space for TikTok
+                    '-color_primaries', 'bt709',
+                    '-color_trc', 'bt709',
+                    '-c:a', 'copy',  # Copy audio without re-encoding (preserve quality)
                     '-map', '0:v:0',
                     '-map', '1:a:0',
                     '-t', f'{audio_duration:.3f}',  # Force exact audio duration
                     str(output_path)
                 ]
-                print(f"✓ Burning captions into video from {subtitle_path}")
+                print(f"✓ Burning professional ASS captions into video from {subtitle_path}")
+                # Debug: Print first few lines of ASS file to verify it's correct
+                try:
+                    with open(subtitle_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()[:15]
+                        print(f"   ASS file preview (first 15 lines):")
+                        for line in lines:
+                            print(f"     {line.rstrip()}")
+                except Exception as e:
+                    print(f"   Could not read ASS file for preview: {e}")
             else:
                 # No subtitles, just add audio
                 final_cmd = [
@@ -1685,9 +1793,16 @@ async def compile_video(request: CompileVideoRequest):
                 ]
             
             try:
+                print(f"   Running FFmpeg command: {' '.join(final_cmd[:5])}... [truncated]")
                 result = subprocess.run(final_cmd, check=True, capture_output=True, timeout=180, text=True)
-                print(f"✓ Final video created with audio")
+                print(f"✓ Final video created with audio and subtitles")
                 print(f"   Target duration: {audio_duration:.2f}s")
+                
+                # Check for subtitle-related warnings in stderr
+                if result.stderr:
+                    stderr_lower = result.stderr.lower()
+                    if 'font' in stderr_lower or 'subtitle' in stderr_lower or 'ass' in stderr_lower or 'libass' in stderr_lower:
+                        print(f"   ⚠ Subtitle-related warnings: {result.stderr[:1000]}")
                 
                 # Verify final video duration
                 try:
@@ -1704,10 +1819,11 @@ async def compile_video(request: CompileVideoRequest):
                 if result.stderr:
                     print(f"   Final stderr: {result.stderr[:500]}")
             except subprocess.CalledProcessError as e:
-                error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                # stderr is already a string when text=True is used
+                error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ FFmpeg final error: {error_msg[:500]}")
                 if e.stdout:
-                    print(f"   FFmpeg stdout: {e.stdout.decode()[:500]}")
+                    print(f"   FFmpeg stdout: {e.stdout[:500]}")
                 raise HTTPException(status_code=500, detail="Failed to combine video and audio")
             
             # Read the final video and return as base64
