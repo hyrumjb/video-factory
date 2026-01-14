@@ -1,5 +1,190 @@
 import re
-from config import TTS_AVAILABLE, tts_client, texttospeech
+from typing import List, Optional
+
+def convert_elevenlabs_alignment_to_word_timings(text: str, alignment) -> list:
+    """
+    Convert ElevenLabs character-level alignment to word-level timing.
+
+    ElevenLabs returns:
+    - alignment.characters: list of characters
+    - alignment.character_start_times_seconds: list of start times
+    - alignment.character_end_times_seconds: list of end times
+
+    Returns a list of dicts with 'word', 'start', 'end' for each word.
+    """
+    if not alignment:
+        return []
+
+    try:
+        characters = alignment.characters if hasattr(alignment, 'characters') else []
+        start_times = alignment.character_start_times_seconds if hasattr(alignment, 'character_start_times_seconds') else []
+        end_times = alignment.character_end_times_seconds if hasattr(alignment, 'character_end_times_seconds') else []
+
+        if not characters or not start_times or not end_times:
+            print(f"⚠ ElevenLabs alignment missing data: chars={len(characters)}, starts={len(start_times)}, ends={len(end_times)}")
+            return []
+
+        print(f"✓ ElevenLabs alignment: {len(characters)} characters with timing")
+
+        # Build word timings from character timings
+        word_timings = []
+        current_word = ""
+        word_start = None
+        word_end = None
+
+        for i, char in enumerate(characters):
+            if i >= len(start_times) or i >= len(end_times):
+                break
+
+            char_start = start_times[i]
+            char_end = end_times[i]
+
+            # Check if this is a word boundary (space or start of text)
+            if char == ' ' or char == '\n':
+                # End of word - save it if we have one
+                if current_word.strip() and word_start is not None:
+                    word_timings.append({
+                        'word': current_word.strip(),
+                        'start': word_start,
+                        'end': word_end
+                    })
+                current_word = ""
+                word_start = None
+                word_end = None
+            else:
+                # Part of a word
+                if word_start is None:
+                    word_start = char_start
+                word_end = char_end
+                current_word += char
+
+        # Don't forget the last word
+        if current_word.strip() and word_start is not None:
+            word_timings.append({
+                'word': current_word.strip(),
+                'start': word_start,
+                'end': word_end
+            })
+
+        print(f"✓ Converted to {len(word_timings)} word timings")
+        if word_timings:
+            preview = [(w['word'], f"{w['start']:.2f}s-{w['end']:.2f}s") for w in word_timings[:3]]
+            print(f"   First 3 words: {preview}")
+
+        return word_timings
+
+    except Exception as e:
+        print(f"⚠ Error converting ElevenLabs alignment: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration: float) -> str:
+    """
+    Create ASS subtitle file from ElevenLabs alignment data.
+    Uses the same state-based karaoke style as Google TTS version.
+    """
+    word_timings = convert_elevenlabs_alignment_to_word_timings(script, alignment)
+
+    if not word_timings:
+        print("⚠ No word timings from ElevenLabs, falling back to even timing")
+        return create_ass_fallback(script, audio_duration)
+
+    print(f"\n🎤 ========== ELEVENLABS KARAOKE SETUP ==========")
+    print(f"📝 Script length: {len(script)} chars")
+    print(f"⏱️  Audio duration: {audio_duration:.2f}s")
+    print(f"🔢 Word timings: {len(word_timings)}")
+
+    # ASS file header (same styling as Google TTS version)
+    ass_lines = [
+        "[Script Info]",
+        "Title: Professional Video Factory Subtitles",
+        "ScriptType: v4.00+",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Default,Inter,16,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,10,1,2,10,10,55,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    def format_ass_time(seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        centiseconds = int((seconds % 1) * 100)
+        return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+
+    def is_sentence_ending(word: str) -> bool:
+        return bool(re.search(r'[.!?]+$', word))
+
+    # Group words into 1-3 word phrases
+    max_words_per_subtitle = 3
+    i = 0
+    global_end_time = 0.0
+
+    while i < len(word_timings):
+        # Build phrase (1-3 words, stop at sentence endings)
+        phrase_timings = []
+        start_idx = i
+
+        while len(phrase_timings) < max_words_per_subtitle and i < len(word_timings):
+            phrase_timings.append(word_timings[i])
+            i += 1
+
+            # Stop at sentence endings
+            if is_sentence_ending(phrase_timings[-1]['word']):
+                break
+
+        if not phrase_timings:
+            break
+
+        # Generate state-based karaoke: one dialogue line per word
+        # Extend each word's end time to meet the next word's start to prevent flashing
+        for highlight_idx, timing in enumerate(phrase_timings):
+            text_parts = []
+            for word_idx, wt in enumerate(phrase_timings):
+                word = wt['word']
+                if word_idx == highlight_idx:
+                    text_parts.append(f"{{\\1c&H0000FFFF&}}{word}")
+                else:
+                    text_parts.append(f"{{\\1c&H00FFFFFF&}}{word}")
+
+            karaoke_text = "{\\an2}" + " ".join(text_parts)
+
+            # Use actual word timing from ElevenLabs
+            line_start = max(timing['start'], global_end_time)
+
+            # Extend end time to next word's start (no gaps = no flashing)
+            if highlight_idx < len(phrase_timings) - 1:
+                # Not the last word in phrase - extend to next word's start
+                next_timing = phrase_timings[highlight_idx + 1]
+                line_end = next_timing['start']
+            else:
+                # Last word in phrase - check if there's a next phrase
+                if i < len(word_timings):
+                    # Extend to next phrase's first word
+                    line_end = word_timings[i]['start']
+                else:
+                    # Last word overall - use its natural end time
+                    line_end = timing['end']
+
+            # Ensure minimum duration
+            if line_end - line_start < 0.15:
+                line_end = line_start + 0.15
+
+            dialogue_line = f"Dialogue: 0,{format_ass_time(line_start)},{format_ass_time(line_end)},Default,,0,0,0,,{karaoke_text}"
+            ass_lines.append(dialogue_line)
+
+            global_end_time = line_end
+
+    print(f"✅ ELEVENLABS KARAOKE ASS FILE GENERATED: {len(ass_lines)} lines")
+    print(f"==========================================\n")
+
+    return '\n'.join(ass_lines)
+
 
 def create_srt_from_timepoints(script: str, timepoints: list, audio_duration: float, style: str = "3words") -> str:
     """
@@ -67,7 +252,7 @@ def create_srt_from_timepoints(script: str, timepoints: list, audio_duration: fl
         
         if style == "varying":
             # Smart varying length - build subtitle based on character count
-            words_for_subtitle = []
+            words_for_subtitle: List[str] = []
             char_count = 0
             line_breaks = 0
             start_word_idx = i
@@ -97,9 +282,9 @@ def create_srt_from_timepoints(script: str, timepoints: list, audio_duration: fl
             subtitle_text = ''.join(words_for_subtitle).strip()
         else:
             # Fixed word count per subtitle - but for 3words style, respect sentence endings
-            words_for_subtitle = []
+            words_for_subtitle: List[str] = []
             start_word_idx = i
-            
+
             def is_sentence_ending(word: str) -> bool:
                 return bool(re.search(r'[.!?]+$', word))
             
@@ -262,27 +447,25 @@ def create_srt_fallback(script: str, audio_duration: float) -> str:
 
 def create_ass_from_timepoints(script: str, timepoints: list, audio_duration: float, style: str = "3words") -> str:
     """
-    Create professional ASS (Advanced SubStation Alpha) subtitle file with karaoke effects.
-    
-    Requirements:
+    Create ASS (Advanced SubStation Alpha) subtitle file with state-based karaoke.
+
+    Settings:
     - Bold sans-serif font (Inter Bold)
-    - White text with dark stroke and subtle shadow
-    - Font size: 68px
-    - Outline: 4px, Shadow: 2px
-    - Alignment: bottom-center (2)
-    - Margin bottom: 180px
+    - Font size: 16px (small for mobile videos)
+    - Outline: 6px (thick black border)
+    - Shadow: 1px
+    - Alignment: bottom-center (2) with \\an2 override for stability
+    - MarginV: 25px (near bottom of screen)
     - Maximum 3 words per subtitle line
-    - Maximum 2 lines at once
-    - Natural phrase grouping (1-3 words per highlight beat)
-    - Karaoke highlighting with \\k tags (TikTok-style yellow/cyan)
-    - Non-highlighted text stays white
-    - Instant fade-in, no animation delay
-    
+    - State-based highlighting: generates separate dialogue lines for each word,
+      only the currently-spoken word is yellow, all others are white
+    - Clean instant transitions with no fading
+
     Args:
         script: The script text
         timepoints: List of timepoints from Google TTS
         audio_duration: Total audio duration in seconds
-        style: Caption style - always "3words" for professional subtitles
+        style: Caption style
     """
     if not timepoints or len(timepoints) == 0:
         return create_ass_fallback(script, audio_duration)
@@ -317,24 +500,27 @@ def create_ass_from_timepoints(script: str, timepoints: list, audio_duration: fl
         sample_keys = list(timepoint_map.keys())[:5]
         print(f"   Sample timepoints: {[(k, timepoint_map[k]) for k in sample_keys]}")
     
-    # Professional subtitle settings: 6-9 words per line for TikTok-style captions
-    # Ideal duration per line: 1.5 - 3.5 seconds
-    max_words_per_subtitle = 9
+    # Subtitle settings: max 3 words per subtitle for easy reading
+    max_words_per_subtitle = 3
     min_words_per_subtitle = 1  # Allow natural phrase breaks
     
     # ASS file header with professional TikTok-style styling
-    # Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, 
-    #         Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, 
+    # Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,
+    #         Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle,
     #         Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-    # 
-    # CRITICAL: ASS karaoke color logic (REVERSED from what you might expect):
-    # - PrimaryColour = White (BGR: &H00FFFFFF) - inactive words (default)
-    # - SecondaryColour = Yellow (BGR: &H0000FFFF) - active word during \k timing
-    # - OutlineColour = Black (BGR: &H00000000) - stroke color
-    # 
-    # TikTok-style settings:
-    # - Fontname=Inter, Fontsize=56, Bold=1, Outline=2, Shadow=0
-    # - Alignment=2 (bottom-center), MarginV=180 (180px from bottom), BorderStyle=1
+    #
+    # STATE-BASED KARAOKE (generates separate dialogue lines):
+    # - Instead of transforms, we generate one dialogue line per word
+    # - Each line shows ALL words with explicit color tags
+    # - Only the currently-spoken word is yellow, others are white
+    # - Lines are timed precisely to switch at word boundaries
+    # - This gives clean instant transitions with no fading
+    #
+    # Settings:
+    # - Fontname=Inter, Fontsize=16, Bold=1, Outline=10 (thick), Shadow=1
+    # - Alignment=2 (bottom-center), MarginV=55, BorderStyle=1
+    # - \an2 override in each dialogue line for stable vertical positioning
+    # - global_end_time tracking prevents overlap between subtitle groups
     ass_lines = [
         "[Script Info]",
         "Title: Professional Video Factory Subtitles",
@@ -342,24 +528,26 @@ def create_ass_from_timepoints(script: str, timepoints: list, audio_duration: fl
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        # Style: Default, Inter Bold, 56px, White (both Primary and Secondary - explicit colors in tags handle karaoke)
-        # Bold=1, Outline=2px, Shadow=0px, Alignment=2 (bottom-center), MarginV=180px, BorderStyle=1
-        "Style: Default,Inter,56,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,0,2,20,20,180,1",
+        # Style: Default, Inter Bold, 16px (small for mobile videos)
+        # PrimaryColour = White (default text color)
+        # Bold=1, Outline=10px (thick black border), Shadow=1px, MarginV=55px
+        "Style: Default,Inter,16,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,10,1,2,10,10,55,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
-    
+
     # DEBUG: Print style definition
-    print(f"\n🎨 ASS STYLE DEFINITION:")
-    print(f"   Font: Inter, Size: 56px, Bold: 1")
-    print(f"   PrimaryColour (inactive): &H00FFFFFF (White in BGR)")
-    print(f"   SecondaryColour (active): &H0000FFFF (Yellow in BGR)")
-    print(f"   Outline: 2px, Shadow: 0px")
-    print(f"   Alignment: 2 (bottom-center)")
-    print(f"   MarginV: 250px (250px from bottom of screen)")
-    print(f"   BorderStyle: 1")
-    print(f"   Full style line: Style: Default,Inter,56,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,0,2,20,20,250,1")
+    print("\n🎨 ASS STYLE DEFINITION:")
+    print("   Font: Inter, Size: 16px, Bold: 1")
+    print("   Using state-based karaoke (separate dialogue lines per word)")
+    print("   Yellow = currently spoken word, White = all other words")
+    print("   Outline: 10px (thick black border), Shadow: 1px")
+    print("   Alignment: 2 (bottom-center) with \\an2 override")
+    print("   MarginV: 55px from bottom")
+
+    # Track cumulative end time to prevent overlap between subtitle groups
+    global_end_time = 0.0
     
     # Group words into subtitle lines with karaoke effects
     subtitle_index = 1
@@ -389,7 +577,7 @@ def create_ass_from_timepoints(script: str, timepoints: list, audio_duration: fl
             break
         
         # Natural phrase grouping: 1-3 words, respecting sentence endings and natural pauses
-        words_for_subtitle = []
+        words_for_subtitle: List[str] = []
         start_word_idx = i
         
         # Build phrase with natural grouping (1-3 words)
@@ -431,115 +619,85 @@ def create_ass_from_timepoints(script: str, timepoints: list, audio_duration: fl
             end_time = start_time + min_duration
         end_time = min(end_time, audio_duration)
         
-        # Build karaoke text with \k tags for word-by-word highlighting
-        # 
-        # CRITICAL ASS KARAOKE LOGIC (REVERSED):
-        # - PrimaryColour = White (inactive words - default)
-        # - SecondaryColour = Yellow (active word during \k timing)
-        # - \k tag switches text to SecondaryColour (yellow) for the duration
-        # - When next \k starts, previous text reverts to PrimaryColour (white)
+        # STATE-BASED KARAOKE: Generate separate dialogue lines for each word highlight state
         #
-        # Format: {\kXX}word where XX = centiseconds
-        # Example: {\k12}This {\k18}is {\k22}karaoke
-        # - "This" is yellow for 12cs, then white
-        # - "is" is yellow for 18cs, then white
-        # - "karaoke" is yellow for 22cs, then white
+        # Instead of using transforms (which can fade/conflict), we generate one dialogue
+        # line per word, each showing ALL words but with explicit colors:
+        # - The currently-spoken word is yellow
+        # - All other words are white
+        # - Lines are timed precisely to switch at word boundaries
         #
-        # IMPORTANT: Spaces must be INSIDE the karaoke tag to prevent visual jank
-        # Use explicit color tags for renderer-safe karaoke
-        karaoke_parts = []
-        karaoke_debug = []  # Debug info for each word
-        duration_seconds_list = []  # Track all durations for end_time calculation
-        
-        # Normalize karaoke timing to relative durations (monotonic)
-        prev_word_end = start_time
-        
+        # Example for "Hello beautiful world":
+        # - Line 1 (0.0s-0.5s): "{\1c&H0000FFFF&}Hello {\1c&H00FFFFFF&}beautiful world"
+        # - Line 2 (0.5s-1.2s): "Hello {\1c&H0000FFFF&}beautiful {\1c&H00FFFFFF&}world"
+        # - Line 3 (1.2s-1.6s): "Hello beautiful {\1c&H0000FFFF&}world"
+
+        # First, calculate timing for each word
+        # CRITICAL: Use max(start_time, global_end_time) to prevent overlap with previous group
+        word_timings = []  # List of (word, abs_start, abs_end)
+        prev_word_end = max(start_time, global_end_time)
+
         for word_idx, word in enumerate(words_for_subtitle):
             word_global_idx = start_word_idx + word_idx
-            
+
             # Get absolute end time for this word
             absolute_end = timepoint_map.get(word_global_idx, end_time)
-            
-            # Calculate duration from previous word end (relative, monotonic)
-            # Minimum 150ms (15cs) to prevent flicker and ensure karaoke works
+
+            # Calculate duration (minimum 150ms)
             duration = max(absolute_end - prev_word_end, 0.15)
-            duration_cs = int(duration * 100)
-            duration_seconds_list.append(duration)
-            
-            # Update previous word end for next iteration
-            prev_word_end = absolute_end
-            
-            # Attach non-breaking space to word except last word (spaces must be INSIDE karaoke tag)
-            text = word + ("\u00A0" if word_idx < len(words_for_subtitle) - 1 else "")
-            
-            # Explicit color tags for renderer-safe karaoke using \k (karaoke):
-            # {\kXX\c&H0000FFFF&}text{\c&H00FFFFFF&}
-            # - \kXX = karaoke timing in centiseconds
-            # - \c&H0000FFFF& = explicit yellow color (active word)
-            # - text = the word
-            # - \c&H00FFFFFF& = explicit white color (revert to inactive)
-            karaoke_tag = (
-                f"{{\\k{duration_cs}\\c&H0000FFFF&}}"
-                f"{text}"
-                f"{{\\c&H00FFFFFF&}}"
-            )
-            karaoke_parts.append(karaoke_tag)
-            
-            # Debug info (capture start time before updating prev_word_end)
-            word_start_time = prev_word_end
-            karaoke_debug.append({
+
+            word_start = prev_word_end
+            word_end = prev_word_end + duration
+
+            word_timings.append({
                 'word': word,
-                'word_idx': word_global_idx,
-                'start': word_start_time,
-                'end': absolute_end,
-                'duration_seconds': duration,
-                'duration_cs': duration_cs,
-                'tag': karaoke_tag
+                'start': word_start,
+                'end': word_end
             })
-        
-        karaoke_text = "".join(karaoke_parts)
-        
-        # CRITICAL: Compute dialogue end from karaoke time, not timepoints
-        # end_time = start_time + sum(duration_seconds) + 0.20
-        sum_duration_seconds = sum(duration_seconds_list)
-        end_time = start_time + sum_duration_seconds + 0.20
-        end_time = min(end_time, audio_duration)
-        
-        # CRITICAL: Verify karaoke timing invariant
-        # sum(duration_cs_list) must be less than (end_time - start_time) * 100
-        duration_cs_list = [int(d * 100) for d in duration_seconds_list]
-        sum_duration_cs = sum(duration_cs_list)
-        total_dialogue_duration_cs = (end_time - start_time) * 100
-        
-        print(f"🔍 KARAOKE INVARIANT CHECK:")
-        print(f"   sum(duration_cs_list) = {sum_duration_cs}cs")
-        print(f"   (end_time - start_time) * 100 = {total_dialogue_duration_cs}cs")
-        print(f"   Assertion: {sum_duration_cs} < {total_dialogue_duration_cs}")
-        
-        assert sum_duration_cs < total_dialogue_duration_cs, (
-            f"Karaoke timing invariant failed! "
-            f"sum(duration_cs_list)={sum_duration_cs} >= (end_time - start_time) * 100={total_dialogue_duration_cs}. "
-            f"Karaoke cannot animate correctly."
-        )
-        
-        print(f"   ✅ Invariant passed!")
-        
-        # DEBUG: Print karaoke info for this subtitle
-        print(f"🎤 KARAOKE DEBUG - Subtitle {subtitle_index}:")
-        print(f"   Words: {words_for_subtitle}")
-        print(f"   Timing: {format_ass_time(start_time)} -> {format_ass_time(end_time)}")
-        print(f"   Generated karaoke text: {karaoke_text}")
-        for dbg in karaoke_debug:
-            # Use raw string or double backslashes for the \k tag in print
-            k_tag = f"\\k{dbg['duration_cs']}"
-            print(f"     Word '{dbg['word']}': {dbg['duration_cs']}cs (\\k{dbg['duration_cs']}) | Duration: {dbg['duration_seconds']:.3f}s | Time: {dbg['start']:.3f}s -> {dbg['end']:.3f}s")
-        print(f"   Full dialogue line: Dialogue: 0,{format_ass_time(start_time)},{format_ass_time(end_time)},Default,,0,0,0,,{karaoke_text}")
-        
-        # Add dialogue line with no fade effects (instant appearance)
-        # Format: Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-        dialogue_line = f"Dialogue: 0,{format_ass_time(start_time)},{format_ass_time(end_time)},Default,,0,0,0,,{karaoke_text}"
-        ass_lines.append(dialogue_line)
-        
+
+            prev_word_end = word_end
+
+        # Generate one dialogue line per word (each with that word highlighted)
+        # Extend each word's end time to meet the next word's start to prevent flashing
+        for highlight_idx, timing in enumerate(word_timings):
+            # Build text with explicit colors for each word
+            text_parts = []
+            for word_idx, wt in enumerate(word_timings):
+                word = wt['word']
+                if word_idx == highlight_idx:
+                    # This word is highlighted (yellow)
+                    text_parts.append(f"{{\\1c&H0000FFFF&}}{word}")
+                else:
+                    # This word is not highlighted (white)
+                    text_parts.append(f"{{\\1c&H00FFFFFF&}}{word}")
+
+            # Join words with spaces
+            karaoke_text = "{\\an2}" + " ".join(text_parts)
+
+            # Dialogue timing: extend to next word's start (no gaps = no flashing)
+            line_start = timing['start']
+            if highlight_idx < len(word_timings) - 1:
+                # Not the last word - extend to next word's start
+                line_end = word_timings[highlight_idx + 1]['start']
+            else:
+                # Last word in phrase - check if there's more content
+                if i < len(word_list):
+                    # Get the start time of the next phrase's first word
+                    next_word_idx = i
+                    next_start = timepoint_map.get(next_word_idx - 1, timing['end']) if next_word_idx > 0 else timing['end']
+                    line_end = max(timing['end'], next_start)
+                else:
+                    line_end = timing['end']
+
+            dialogue_line = f"Dialogue: 0,{format_ass_time(line_start)},{format_ass_time(line_end)},Default,,0,0,0,,{karaoke_text}"
+            ass_lines.append(dialogue_line)
+
+            print(f"🎤 KARAOKE - Word {highlight_idx + 1}: '{timing['word']}' highlighted from {format_ass_time(line_start)} to {format_ass_time(line_end)}")
+
+        # Update global_end_time to prevent overlap with next subtitle group
+        if word_timings:
+            global_end_time = word_timings[-1]['end']
+
         subtitle_index += 1
     
     # DEBUG: Print final ASS file summary
@@ -590,9 +748,9 @@ def create_ass_fallback(script: str, audio_duration: float) -> str:
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        # Style: Default, Inter Bold, 68px, Yellow highlight, White text, Black stroke, No background
-        # Bold=1, Outline=4px, Shadow=2px, Alignment=2 (bottom-center), MarginV=180px
-        "Style: Default,Inter,68,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,2,2,20,20,250,1",
+        # Style: Consistent with main function
+        # PrimaryColour = White, Bold=1, Outline=10px (thick black border), MarginV=55px
+        "Style: Default,Inter,16,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,10,1,2,10,10,55,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -610,6 +768,7 @@ def create_ass_fallback(script: str, audio_duration: float) -> str:
     for i, phrase in enumerate(phrases):
         start_time = i * duration_per_phrase
         end_time = (i + 1) * duration_per_phrase if i < len(phrases) - 1 else audio_duration
-        ass_lines.append(f"Dialogue: 0,{format_ass_time(start_time)},{format_ass_time(end_time)},Default,,0,0,0,,{phrase}")
+        # Add \an2 for consistent bottom-center positioning
+        ass_lines.append(f"Dialogue: 0,{format_ass_time(start_time)},{format_ass_time(end_time)},Default,,0,0,0,,{{\\an2}}{phrase}")
     
     return '\n'.join(ass_lines)

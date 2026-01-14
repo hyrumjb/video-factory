@@ -30,10 +30,14 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         # Download audio
         audio_data = None
         if request.audio_url.startswith('data:audio'):
-            # Extract base64 audio data
+            # Extract base64 audio data and detect format
             audio_base64 = request.audio_url.split(',')[1]
             audio_data = base64.b64decode(audio_base64)
-            audio_path = temp_path / "audio.wav"
+            # Detect audio format from data URL (e.g., data:audio/mp3;base64, or data:audio/wav;base64,)
+            if 'audio/mp3' in request.audio_url or 'audio/mpeg' in request.audio_url:
+                audio_path = temp_path / "audio.mp3"
+            else:
+                audio_path = temp_path / "audio.wav"
             with open(audio_path, 'wb') as f:
                 f.write(audio_data)
         else:
@@ -41,10 +45,15 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             audio_response = requests.get(request.audio_url, timeout=30)
             if audio_response.status_code != 200:
                 raise HTTPException(status_code=500, detail="Failed to download audio")
-            audio_path = temp_path / "audio.wav"
+            # Detect format from content-type header or URL
+            content_type = audio_response.headers.get('content-type', '')
+            if 'mp3' in content_type or 'mpeg' in content_type or request.audio_url.endswith('.mp3'):
+                audio_path = temp_path / "audio.mp3"
+            else:
+                audio_path = temp_path / "audio.wav"
             with open(audio_path, 'wb') as f:
                 f.write(audio_response.content)
-        
+
         # Download videos
         video_paths = []
         for i, video_url in enumerate(request.video_urls):
@@ -127,7 +136,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 trimmed_videos.append(trimmed_path)
                 print(f"✓ Trimmed video {i+1} to {scene_duration:.2f}s")
             except subprocess.CalledProcessError as e:
-                error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ Failed to trim video {i+1}: {error_msg[:200]}")
                 raise HTTPException(status_code=500, detail=f"Failed to trim video {i+1} to {scene_duration:.2f}s")
         
@@ -151,7 +160,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 result = subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
                 print(f"✓ Scaled single video to vertical format")
             except subprocess.CalledProcessError as e:
-                error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ Failed to scale video: {error_msg[:200]}")
                 raise HTTPException(status_code=500, detail="Failed to scale video")
         else:
@@ -187,7 +196,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 result = subprocess.run(concat_cmd, check=True, capture_output=True, timeout=180, text=True)
                 print(f"✓ Concatenated {len(trimmed_videos)} videos")
             except subprocess.CalledProcessError as e:
-                error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+                error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ FFmpeg concat error: {error_msg[:500]}")
                 raise HTTPException(status_code=500, detail="Failed to concatenate videos")
         
@@ -298,7 +307,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             result = subprocess.run(final_cmd, check=True, capture_output=True, timeout=180, text=True)
             print(f"✓ Final video created with audio")
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.decode() if e.stderr else 'Unknown error'
+            error_msg = e.stderr if e.stderr else 'Unknown error'
             print(f"✗ FFmpeg final error: {error_msg[:500]}")
             raise HTTPException(status_code=500, detail="Failed to combine video and audio")
         

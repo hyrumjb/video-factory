@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
-from openai import OpenAI
+from sse_starlette.sse import EventSourceResponse
 import os
 import base64
 import re
@@ -13,7 +12,35 @@ import subprocess
 from typing import Optional, List
 from urllib.parse import quote_plus
 from pathlib import Path
-from dotenv import load_dotenv
+
+# Import shared configuration
+from config import (
+    FFMPEG_EXECUTABLE,
+    FFPROBE_EXECUTABLE,
+    TTS_AVAILABLE,
+    tts_client,
+    texttospeech,
+    openai_client,
+    ELEVENLABS_AVAILABLE,
+    elevenlabs_client,
+)
+
+# Import models
+from models import (
+    ScriptRequest,
+    TTSRequest,
+    MultiVoiceTTSRequest,
+    VideoSearchRequest,
+    VideoItem,
+    VideoSearchResponse,
+    CompileVideoRequest,
+    CompileVideoResponse,
+    VideoScene,
+    ScriptResponse,
+    TTSResponse,
+    VoiceAudio,
+    MultiVoiceTTSResponse,
+)
 
 # Import ASS subtitle functions from subtitles module
 try:
@@ -23,36 +50,119 @@ except ImportError:
     create_ass_from_timepoints = None
     create_ass_fallback = None
 
-# Get ffmpeg executable path from imageio-ffmpeg
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
-except ImportError:
-    # Fallback to system ffmpeg if imageio-ffmpeg not available
-    FFMPEG_EXECUTABLE = 'ffmpeg'
-    FFPROBE_EXECUTABLE = 'ffprobe'
-else:
-    # Use ffprobe from the same location
-    ffmpeg_dir = os.path.dirname(FFMPEG_EXECUTABLE)
-    FFPROBE_EXECUTABLE = os.path.join(ffmpeg_dir, 'ffprobe' + ('.exe' if os.name == 'nt' else ''))
+# Import script generation module
+from script_generation import generate_script as generate_script_impl
 
-# Try to import Google TTS, but make it optional
-# Use v1beta1 for timepointing support (required for caption timing)
-try:
-    from google.cloud import texttospeech_v1beta1 as texttospeech
-    TTS_AVAILABLE = True
-except ImportError:
-    # Fallback to stable v1 if beta not available (no timepointing)
+# Import orchestrator
+from orchestrator import VideoCreationOrchestrator
+
+
+def calculate_scene_durations_from_alignment(
+    alignment: dict,
+    scenes: List[dict],
+    audio_duration: float
+) -> List[float]:
+    """
+    Calculate scene durations from ElevenLabs alignment data and scene word boundaries.
+
+    Args:
+        alignment: ElevenLabs alignment dict with 'characters', 'character_start_times_seconds', 'character_end_times_seconds'
+        scenes: List of scene dicts with 'scene_number', 'word_start', 'word_end'
+        audio_duration: Total audio duration in seconds
+
+    Returns:
+        List of durations in seconds for each scene
+    """
+    if not alignment or not scenes:
+        return []
+
     try:
-        from google.cloud import texttospeech
-        TTS_AVAILABLE = True
-        print("⚠ Warning: Using stable v1 API - timepointing not available. Install latest google-cloud-texttospeech for caption timing support.")
-    except ImportError:
-        TTS_AVAILABLE = False
-        print("⚠ Warning: google-cloud-texttospeech not installed. TTS functionality will be disabled.")
+        characters = alignment.get('characters', [])
+        start_times = alignment.get('character_start_times_seconds', [])
+        end_times = alignment.get('character_end_times_seconds', [])
 
-# Load environment variables
-load_dotenv()
+        if not characters or not start_times or not end_times:
+            print("⚠ Alignment data incomplete, cannot calculate scene durations")
+            return []
+
+        # Build word boundaries from character data
+        # Find where each word starts and ends in the character array
+        word_boundaries: List[dict] = []  # List of {word_index, start_time, end_time}
+        current_word_index = 0
+        word_start_time = None
+        word_end_time = None
+
+        for i, char in enumerate(characters):
+            if i >= len(start_times) or i >= len(end_times):
+                break
+
+            if char == ' ' or char == '\n':
+                # End of word
+                if word_start_time is not None:
+                    word_boundaries.append({
+                        'word_index': current_word_index,
+                        'start': word_start_time,
+                        'end': word_end_time
+                    })
+                    current_word_index += 1
+                word_start_time = None
+                word_end_time = None
+            else:
+                # Part of a word
+                if word_start_time is None:
+                    word_start_time = start_times[i]
+                word_end_time = end_times[i]
+
+        # Don't forget the last word
+        if word_start_time is not None:
+            word_boundaries.append({
+                'word_index': current_word_index,
+                'start': word_start_time,
+                'end': word_end_time
+            })
+
+        print(f"✓ Built {len(word_boundaries)} word boundaries from alignment")
+
+        # Create a map of word_index -> timing
+        word_timing_map = {wb['word_index']: wb for wb in word_boundaries}
+
+        # Calculate duration for each scene based on word boundaries
+        scene_durations: List[float] = []
+
+        for scene in sorted(scenes, key=lambda s: s.get('scene_number', 0)):
+            word_start = scene.get('word_start', 0)
+            word_end = scene.get('word_end', len(word_boundaries))
+
+            # Get start time (from word_start)
+            if word_start in word_timing_map:
+                start_time = word_timing_map[word_start]['start']
+            elif word_start == 0:
+                start_time = 0.0
+            else:
+                # Estimate: use previous word's end time
+                prev_words = [w for w in word_boundaries if w['word_index'] < word_start]
+                start_time = prev_words[-1]['end'] if prev_words else 0.0
+
+            # Get end time (from word_end - 1, since word_end is exclusive)
+            end_word_index = word_end - 1
+            if end_word_index in word_timing_map:
+                end_time = word_timing_map[end_word_index]['end']
+            else:
+                # Estimate: use last known word's end time or audio duration
+                end_time = audio_duration
+
+            duration = max(end_time - start_time, 0.5)  # Minimum 0.5 second per scene
+            scene_durations.append(duration)
+
+            print(f"   Scene {scene.get('scene_number')}: words {word_start}-{word_end} = {start_time:.2f}s - {end_time:.2f}s ({duration:.2f}s)")
+
+        return scene_durations
+
+    except Exception as e:
+        print(f"⚠ Error calculating scene durations: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 app = FastAPI()
 
@@ -65,104 +175,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Initialize Google TTS client
-tts_client = None
-google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
-# Try to find credentials file if not set in env
-if not google_creds_path:
-    # Check common locations
-    possible_paths = [
-        "./google-credentials.json",
-        "./credentials.json",
-        "../google-credentials.json",
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(path)
-            google_creds_path = os.path.abspath(path)
-            break
-
-if TTS_AVAILABLE:
-    try:
-        if google_creds_path and os.path.exists(google_creds_path):
-            tts_client = texttospeech.TextToSpeechClient()
-            print(f"✓ Google TTS client initialized with credentials: {google_creds_path}")
-        else:
-            print("⚠ Warning: Google TTS credentials not found. TTS will not work.")
-            print("   To enable TTS, download credentials from Google Cloud Console and:")
-            print("   1. Save the JSON file as 'google-credentials.json' in the backend folder")
-            print("   2. Or set GOOGLE_APPLICATION_CREDENTIALS environment variable")
-            tts_client = None
-    except Exception as e:
-        print(f"⚠ Warning: Could not initialize Google TTS client: {e}")
-        print("   TTS functionality will be disabled until credentials are configured.")
-        tts_client = None
+# Log TTS status
+if TTS_AVAILABLE and tts_client:
+    print("✓ Google TTS client initialized")
+elif TTS_AVAILABLE:
+    print("⚠ Warning: Google TTS credentials not found. TTS will not work.")
 else:
-    tts_client = None
     print("⚠ Google TTS package not installed. Install with: pip install google-cloud-texttospeech")
 
-# Request models
-class ScriptRequest(BaseModel):
-    topic: str
-
-class TTSRequest(BaseModel):
-    text: str
-    voice_name: Optional[str] = "en-US-Neural2-H"  # Default voice
-
-class MultiVoiceTTSRequest(BaseModel):
-    text: str
-    voices: Optional[List[str]] = None  # If None, use all Neural2 voices
-
-class VideoSearchRequest(BaseModel):
-    search_query: str
-
-class VideoItem(BaseModel):
-    id: str
-    url: str
-    thumbnail_url: str
-    source: str  # "pexels" or "pixabay"
-    duration: Optional[int] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-
-class VideoSearchResponse(BaseModel):
-    videos: list[VideoItem]
-
-class CompileVideoRequest(BaseModel):
-    video_urls: List[str]  # List of video URLs to combine
-    audio_url: str  # Base64 audio data URL
-    script: str  # Script text for captions
-    scene_durations: Optional[List[float]] = None  # Duration for each scene in seconds
-    voice_name: Optional[str] = "en-US-Neural2-H"  # Voice used for TTS
-
-class CompileVideoResponse(BaseModel):
-    video_url: str  # Base64 encoded video or URL to final video
-
-# Response models
-class VideoScene(BaseModel):
-    scene_number: int
-    description: str
-    search_keywords: str
-    search_query: str  # Optimized 3-5 word query for stock video APIs
-
-class ScriptResponse(BaseModel):
-    script: str
-    scenes: list[VideoScene]
-
-class TTSResponse(BaseModel):
-    audio_url: str
-
-class VoiceAudio(BaseModel):
-    voice_name: str
-    audio_url: str
-    gender: str
-
-class MultiVoiceTTSResponse(BaseModel):
-    voices: List[VoiceAudio]
 
 @app.get("/")
 def read_root():
@@ -215,309 +235,39 @@ def sanitize_search_query(query: str) -> str:
 
 @app.post("/api/generate-script", response_model=ScriptResponse)
 async def generate_script(request: ScriptRequest):
-    try:
-        if not request.topic or not request.topic.strip():
-            raise HTTPException(status_code=400, detail="Topic is required")
+    """
+    Generate a video script with scenes using the script_generation module.
+    Uses HOOK/BODY structure with word boundaries for scene timing.
+    """
+    return await generate_script_impl(request)
 
-        # System prompt for 30-second edgy, controversial video script
-        system_prompt = """You are a script writer creating 30-second TikTok-length videos. Make them as EDGY and CONTROVERSIAL as possible about the given topic.
-CRITICAL REQUIREMENTS:
-- Start with a CRISP HOOK that grabs attention immediately
-- DO RESEARCH and provide ACTUAL FACTS and little-known information that people wouldn't know
-- Every sentence must be a STATEMENT OF FACT - NO questions whatsoever
-- Every sentence should build on the previous ones, creating a chain of controversial revelations
-- NO dashes (use commas or periods instead - Google TTS doesn't pause properly for dashes)
-- NO question marks - only statements of fact
-- Spout EDGY, CONTROVERSIAL, and obscure facts/ideas about the topic
-- NO call-to-action, NO "find out more", NO "learn anything new" - just pure edgy information dumping
-- Pack it with crazy, interesting, provocative statements - make it as controversial as possible
-- Script should be exactly 30 seconds when spoken at normal pace
-- Write ONLY the raw spoken script - no quotes, no visual descriptions, no stage directions, no speaker names
-- Output pure dialogue/narration only
 
-Provide exactly 4 video scenes formatted as a JSON array. Each scene needs:
-- scene_number: 1-4
-- description: Visual content description (generic, stock-video-friendly)
-- search_keywords: Comma-separated generic keywords
-- search_query: 3-5 word generic search query for stock video APIs (NO specific names/brands/celebrities, NO filler words like 'a', 'the'). Example: "basketball player court" not "Ricky Rubio basketball"."""
+@app.get("/api/create-video")
+async def create_video_stream(topic: str):
+    """
+    SSE endpoint that orchestrates the entire video creation pipeline.
+    Streams progress events and returns the final video URL.
 
-        # Generate script using OpenAI with structured output
-        user_message = f"""Create a 30-second TikTok-length video script about: {request.topic}.
+    Usage:
+        const eventSource = new EventSource('/api/create-video?topic=...');
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            // data.step: 'script' | 'tts' | 'videos' | 'compile' | 'complete' | 'error'
+            // data.status: 'pending' | 'running' | 'done' | 'error' | 'retrying'
+            // data.message: Human-readable status message
+            // data.data: Step-specific data (script, video_url, etc.)
+        };
+    """
+    async def event_generator():
+        orchestrator = VideoCreationOrchestrator()
+        async for progress_event in orchestrator.create_video(topic):
+            yield {
+                "event": "message",
+                "data": progress_event.to_json()
+            }
 
-DO RESEARCH and find ACTUAL FACTS and little-known information about this topic that people wouldn't know. Make it as EDGY and CONTROVERSIAL as possible.
+    return EventSourceResponse(event_generator())
 
-CRITICAL FORMATTING RULES:
-- Start with a crisp hook, then spout crazy, edgy, little-known facts for 30 seconds
-- NO dashes - use commas or periods instead (dashes don't work with TTS)
-- NO questions - every sentence must be a statement of fact
-- Every sentence should build on the previous ones, revealing controversial facts
-- No learning, no discovery, no call-to-action - just pure provocative information dumping
-- Write ONLY statements of fact, one building on the next
-
-Output format:
-SCRIPT:
-[Raw spoken script only - no descriptions, no formatting, no dashes, no questions]
-
-SCENES:
-[JSON array with exactly 4 scenes, each with scene_number (1-4), description, search_keywords (comma-separated), search_query (3-5 generic words, no names/brands/celebrities)]"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.8,
-            max_tokens=1500
-        )
-
-        response_content = response.choices[0].message.content
-
-        if not response_content:
-            raise HTTPException(status_code=500, detail="Failed to generate script")
-
-        # Debug: Print the raw response to see what we're getting
-        print(f"📝 Raw AI response (first 1000 chars): {response_content[:1000]}")
-
-        # Parse the response to extract script and scenes
-        script = ""
-        scenes = []
-
-        # Try to split by SCRIPT: and SCENES: markers (case-insensitive)
-        script_marker = "SCRIPT:" if "SCRIPT:" in response_content else "script:" if "script:" in response_content else None
-        scenes_marker = "SCENES:" if "SCENES:" in response_content else "scenes:" if "scenes:" in response_content else None
-        
-        if script_marker and scenes_marker:
-            # Split by scenes marker (case-insensitive)
-            import re
-            parts = re.split(r'SCENES?:', response_content, flags=re.IGNORECASE)
-            if len(parts) >= 2:
-                script = parts[0].replace("SCRIPT:", "").replace("script:", "").strip()
-                # Remove any quotes that might wrap the script
-                script = script.strip('"').strip("'").strip('`').strip()
-                scenes_text = parts[1].strip()
-            else:
-                scenes_text = ""
-                script = response_content
-            
-            # Try to extract JSON from the scenes text
-            if scenes_text:
-                try:
-                    scenes_data = []
-                    
-                    # First try: Find JSON array in the text - try multiple patterns
-                    json_match = re.search(r'\[.*?\]', scenes_text, re.DOTALL)
-                    if not json_match:
-                        # Try to find JSON that might be wrapped in code blocks
-                        code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', scenes_text, re.DOTALL)
-                        if code_block_match:
-                            json_match = code_block_match
-                            json_str = code_block_match.group(1)
-                        else:
-                            # Try to find JSON array that spans multiple lines
-                            json_match = re.search(r'\[[\s\S]*?\]', scenes_text)
-                    
-                    if json_match:
-                        json_str = json_match.group() if hasattr(json_match, 'group') else json_match
-                        if isinstance(json_str, re.Match):
-                            json_str = json_str.group()
-                        try:
-                            scenes_data = json.loads(json_str)
-                            print(f"✓ Successfully parsed {len(scenes_data)} scenes from JSON")
-                        except json.JSONDecodeError as e:
-                            print(f"⚠ JSON parse error: {e}")
-                            print(f"   JSON string: {json_str[:200]}")
-                            scenes_data = []
-                    else:
-                        # Second try: Parse numbered list format
-                        # Pattern: "1. \n- description: ...\n- search_keywords: ...\n- search_query: ..."
-                        scenes_data = []
-                        
-                        # Split by numbered items (1., 2., 3., etc.) - match number followed by newline or space
-                        scene_blocks = re.split(r'^\d+\.\s*\n?', scenes_text, flags=re.MULTILINE)
-                        
-                        for block in scene_blocks:
-                            if not block.strip():
-                                continue
-                            
-                            scene_obj = {}
-                            # Extract description - match "- description:" or "description:" with optional dash
-                            desc_match = re.search(r'[-•]\s*description:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if desc_match:
-                                scene_obj['description'] = desc_match.group(1).strip()
-                            else:
-                                # Try without dash
-                                desc_match = re.search(r'description:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                                if desc_match:
-                                    scene_obj['description'] = desc_match.group(1).strip()
-                            
-                            # Extract search_keywords
-                            keywords_match = re.search(r'[-•]\s*search_keywords:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if keywords_match:
-                                scene_obj['search_keywords'] = keywords_match.group(1).strip()
-                            else:
-                                keywords_match = re.search(r'search_keywords:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                                if keywords_match:
-                                    scene_obj['search_keywords'] = keywords_match.group(1).strip()
-                            
-                            # Extract search_query
-                            query_match = re.search(r'[-•]\s*search_query:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if query_match:
-                                scene_obj['search_query'] = query_match.group(1).strip()
-                            else:
-                                query_match = re.search(r'search_query:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                                if query_match:
-                                    scene_obj['search_query'] = query_match.group(1).strip()
-                            
-                            # Only add if we have at least a description
-                            if scene_obj.get('description'):
-                                # Set scene_number if not present
-                                if 'scene_number' not in scene_obj:
-                                    scene_obj['scene_number'] = len(scenes_data) + 1
-                                scenes_data.append(scene_obj)
-                        
-                        # If we still don't have scenes, try line-by-line parsing
-                        if not scenes_data:
-                            lines = scenes_text.split('\n')
-                            current_scene = {}
-                            scene_num = 1
-                            
-                            for line in lines:
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                
-                                # Check if this is a new scene (starts with number)
-                                num_match = re.match(r'^(\d+)\.', line)
-                                if num_match:
-                                    if current_scene.get('description'):
-                                        current_scene['scene_number'] = scene_num
-                                        scenes_data.append(current_scene)
-                                        scene_num += 1
-                                    current_scene = {}
-                                    continue
-                                
-                                # Parse key-value pairs with optional dash/bullet
-                                if ':' in line:
-                                    # Remove leading dash/bullet if present
-                                    line_clean = re.sub(r'^[-•]\s*', '', line)
-                                    key, value = line_clean.split(':', 1)
-                                    key = key.strip().lower().replace('-', '').replace('_', '')
-                                    value = value.strip()
-                                    
-                                    if 'description' in key:
-                                        current_scene['description'] = value
-                                    elif 'searchkeywords' in key or 'keywords' in key:
-                                        current_scene['search_keywords'] = value
-                                    elif 'searchquery' in key or 'query' in key:
-                                        current_scene['search_query'] = value
-                            
-                            # Add last scene
-                            if current_scene.get('description'):
-                                current_scene['scene_number'] = scene_num
-                                scenes_data.append(current_scene)
-                    
-                    # Process scenes_data if we found any
-                    if scenes_data:
-                        # Ensure we have a list
-                        if not isinstance(scenes_data, list):
-                            scenes_data = [scenes_data]
-                        
-                        # Ensure each scene has all required fields
-                        for idx, scene_data in enumerate(scenes_data):
-                            # Set scene_number if missing
-                            if 'scene_number' not in scene_data:
-                                scene_data['scene_number'] = idx + 1
-                            
-                            if 'search_query' not in scene_data or not scene_data.get('search_query'):
-                                # Generate search_query from description if missing
-                                desc = scene_data.get('description', '')
-                                if desc:
-                                    words = desc.split()[:5]
-                                    scene_data['search_query'] = ' '.join(words)
-                            else:
-                                # Sanitize the search query to remove proper nouns
-                                scene_data['search_query'] = sanitize_search_query(scene_data.get('search_query', ''))
-                            if 'search_keywords' not in scene_data or not scene_data.get('search_keywords'):
-                                scene_data['search_keywords'] = scene_data.get('search_query', '')
-                        scenes = [VideoScene(**scene) for scene in scenes_data]
-                    else:
-                        print(f"Could not parse scenes from text. First 500 chars: {scenes_text[:500]}")
-                except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {e}")
-                    print(f"Scenes text snippet: {scenes_text[:500] if 'scenes_text' in locals() else 'N/A'}...")
-                    scenes = []
-                except Exception as e:
-                    # Only log parsing errors, not debug info
-                    print(f"Error parsing scenes: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Scenes text snippet: {scenes_text[:500] if 'scenes_text' in locals() else 'N/A'}...")
-                    scenes = []
-        elif script_marker:
-            # Only script marker found, try to extract script
-            import re
-            parts = re.split(r'SCRIPT?:', response_content, flags=re.IGNORECASE)
-            script = parts[-1].strip().strip('"').strip("'").strip('`').strip()
-            scenes_text = ""
-        else:
-            # Fallback: use entire response as script if format is wrong
-            script = response_content.strip()
-            scenes_text = ""
-            # Try to find JSON array anywhere in the response
-            import re
-            json_match = re.search(r'\[.*?\]', response_content, re.DOTALL)
-            if json_match:
-                try:
-                    json_str = json_match.group()
-                    scenes_data = json.loads(json_str)
-                    print(f"✓ Found JSON array in response, parsed {len(scenes_data)} scenes")
-                    for scene_data in scenes_data:
-                        try:
-                            scene = VideoScene(**scene_data)
-                            scenes.append(scene)
-                        except Exception as e:
-                            print(f"⚠ Error creating scene object: {e}")
-                except json.JSONDecodeError:
-                    print(f"⚠ Could not parse JSON array from response")
-
-        if not script:
-            raise HTTPException(status_code=500, detail="Failed to generate script")
-
-        # Debug: Print what we found
-        print(f"📊 Parsed {len(scenes)} scenes from response")
-        if len(scenes) > 0:
-            print(f"   First scene: {scenes[0].dict() if hasattr(scenes[0], 'dict') else scenes[0]}")
-        else:
-            print(f"⚠ No scenes found! Response content length: {len(response_content)}")
-            print(f"   Response snippet: {response_content[:500]}")
-
-        # Validate scenes - if we don't have 4 valid scenes, raise an error instead of using placeholders
-        if len(scenes) != 4:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to generate scenes. Expected 4 scenes but got {len(scenes)}. The AI response format may be incorrect. Check backend logs for details."
-            )
-
-        # Validate each scene has required fields and sanitize search queries
-        for scene in scenes:
-            if not scene.search_query:
-                # Generate search_query from description if missing
-                words = scene.description.split()[:5]
-                scene.search_query = ' '.join(words)
-            else:
-                # Sanitize the search query to remove proper nouns
-                scene.search_query = sanitize_search_query(scene.search_query)
-            if not scene.search_keywords:
-                scene.search_keywords = scene.search_query
-
-        return ScriptResponse(script=script, scenes=scenes)
-
-    except Exception as e:
-        # Handle OpenAI API errors
-        if hasattr(e, 'status_code'):
-            raise HTTPException(status_code=e.status_code, detail=str(e))
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 def list_available_voices(language_code: str = "en-US"):
     """
@@ -766,6 +516,51 @@ async def generate_tts(request: TTSRequest):
         if hasattr(e, 'status_code'):
             raise HTTPException(status_code=e.status_code, detail=str(e))
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+
+
+@app.post("/api/generate-tts-elevenlabs")
+async def generate_tts_elevenlabs(request: TTSRequest):
+    """
+    Generate TTS audio using ElevenLabs API with word-level timing.
+    Returns audio as base64 encoded MP3 and alignment data for captions.
+    """
+    try:
+        if not request.text or not request.text.strip():
+            raise HTTPException(status_code=400, detail="Text is required")
+
+        if not ELEVENLABS_AVAILABLE or not elevenlabs_client:
+            raise HTTPException(status_code=503, detail="ElevenLabs is not available. Check API key.")
+
+        from tts import generate_elevenlabs_tts_with_timing
+
+        # Use default voice (Brian - narration voice)
+        voice_id = "nPczCjzI2devNBz1zQrb"
+
+        audio_content, alignment = generate_elevenlabs_tts_with_timing(request.text.strip(), voice_id=voice_id)
+
+        # Return audio as base64 encoded string
+        audio_base64 = base64.b64encode(audio_content).decode('utf-8')
+
+        # Serialize alignment data for JSON response
+        alignment_dict = None
+        if alignment:
+            alignment_dict = {
+                'characters': list(alignment.characters) if hasattr(alignment, 'characters') else [],
+                'character_start_times_seconds': list(alignment.character_start_times_seconds) if hasattr(alignment, 'character_start_times_seconds') else [],
+                'character_end_times_seconds': list(alignment.character_end_times_seconds) if hasattr(alignment, 'character_end_times_seconds') else [],
+            }
+            print(f"✓ ElevenLabs alignment serialized: {len(alignment_dict['characters'])} characters")
+
+        return TTSResponse(audio_url=f"data:audio/mp3;base64,{audio_base64}", alignment=alignment_dict)
+
+    except Exception as e:
+        print(f"ElevenLabs TTS generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        if hasattr(e, 'status_code'):
+            raise HTTPException(status_code=e.status_code, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"ElevenLabs TTS generation failed: {str(e)}")
+
 
 @app.post("/api/generate-tts-multi-voice", response_model=MultiVoiceTTSResponse)
 async def generate_tts_multi_voice(request: MultiVoiceTTSRequest):
@@ -1441,10 +1236,14 @@ async def compile_video(request: CompileVideoRequest):
             # Download audio
             audio_data = None
             if request.audio_url.startswith('data:audio'):
-                # Extract base64 audio data
+                # Extract base64 audio data and detect format
                 audio_base64 = request.audio_url.split(',')[1]
                 audio_data = base64.b64decode(audio_base64)
-                audio_path = temp_path / "audio.wav"
+                # Detect audio format from data URL (e.g., data:audio/mp3;base64, or data:audio/wav;base64,)
+                if 'audio/mp3' in request.audio_url or 'audio/mpeg' in request.audio_url:
+                    audio_path = temp_path / "audio.mp3"
+                else:
+                    audio_path = temp_path / "audio.wav"
                 with open(audio_path, 'wb') as f:
                     f.write(audio_data)
             else:
@@ -1452,10 +1251,15 @@ async def compile_video(request: CompileVideoRequest):
                 audio_response = requests.get(request.audio_url, timeout=30)
                 if audio_response.status_code != 200:
                     raise HTTPException(status_code=500, detail="Failed to download audio")
-                audio_path = temp_path / "audio.wav"
+                # Detect format from content-type header or URL
+                content_type = audio_response.headers.get('content-type', '')
+                if 'mp3' in content_type or 'mpeg' in content_type or request.audio_url.endswith('.mp3'):
+                    audio_path = temp_path / "audio.mp3"
+                else:
+                    audio_path = temp_path / "audio.wav"
                 with open(audio_path, 'wb') as f:
                     f.write(audio_response.content)
-            
+
             # Download videos
             video_paths = []
             for i, video_url in enumerate(request.video_urls):
@@ -1517,19 +1321,43 @@ async def compile_video(request: CompileVideoRequest):
             
             if audio_duration is None or audio_duration <= 0:
                 raise HTTPException(status_code=500, detail="Invalid audio duration detected. Please check audio file.")
-            
-            # Calculate equal duration for each video scene
-            scene_duration = audio_duration / len(video_paths)
+
             print(f"📹 Compiling video with {len(video_paths)} videos")
             print(f"🎵 Audio duration: {audio_duration:.2f}s")
-            print(f"⏱️  Scene duration per video: {scene_duration:.2f}s")
-            print(f"📊 Total expected video duration: {scene_duration * len(video_paths):.2f}s")
-            
-            # Trim each video to exactly scene_duration (equal portion of audio length)
+
+            # Calculate scene durations from alignment data and word boundaries
+            scene_durations: List[float] = []
+
+            if request.alignment and request.scenes and len(request.scenes) == len(video_paths):
+                # Check if all scenes have valid word boundaries
+                scenes_with_timing = [s for s in request.scenes if s.word_start is not None and s.word_end is not None]
+                if len(scenes_with_timing) == len(video_paths):
+                    print("📊 Calculating scene durations from alignment data...")
+                    scenes_data = [{'scene_number': s.scene_number, 'word_start': s.word_start, 'word_end': s.word_end}
+                                   for s in scenes_with_timing]
+                    scene_durations = calculate_scene_durations_from_alignment(
+                        request.alignment, scenes_data, audio_duration
+                    )
+                else:
+                    print(f"⚠ Only {len(scenes_with_timing)}/{len(video_paths)} scenes have word timing info")
+
+            # Fallback to equal durations if calculation failed or no data
+            if not scene_durations or len(scene_durations) != len(video_paths):
+                print("📊 Using equal scene durations (fallback)")
+                equal_duration = audio_duration / len(video_paths)
+                scene_durations = [equal_duration] * len(video_paths)
+                print(f"⏱️  Scene duration per video: {equal_duration:.2f}s")
+            else:
+                print(f"✓ Using calculated scene durations: {[f'{d:.2f}s' for d in scene_durations]}")
+
+            print(f"📊 Total expected video duration: {sum(scene_durations):.2f}s")
+
+            # Trim each video to its calculated scene duration
             trimmed_videos = []
             for i, video_path in enumerate(video_paths):
+                scene_duration = scene_durations[i]
                 trimmed_path = temp_path / f"trimmed_video_{i+1}.mp4"
-                # Trim video to exactly scene_duration
+                # Trim video to exact scene duration
                 trim_cmd = [
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(video_path),
@@ -1633,67 +1461,92 @@ async def compile_video(request: CompileVideoRequest):
                         print(f"   FFmpeg stdout: {e.stdout[:500]}")
                     raise HTTPException(status_code=500, detail="Failed to concatenate videos")
             
-            # Step 2: Generate subtitles with timing from Google TTS
+            # Step 2: Generate subtitles with timing
+            # Priority: ElevenLabs alignment > Google TTS timepoints > Fallback
             subtitle_path = None
-            timepoints = None
-            if TTS_AVAILABLE and tts_client and request.script:
+            script_text = request.script.strip()
+
+            # Import ElevenLabs subtitle function
+            try:
+                from subtitles import create_ass_from_elevenlabs_alignment
+            except ImportError:
+                create_ass_from_elevenlabs_alignment = None
+
+            # Check if ElevenLabs alignment data was provided
+            if request.alignment and request.tts_provider == "elevenlabs":
+                print(f"📝 Using ElevenLabs alignment for subtitles...")
                 try:
-                    # CRITICAL: Use the EXACT same script text for both TTS and SRT
-                    # Normalize the script to ensure consistency
-                    script_text = request.script.strip()
-                    print(f"📝 Generating subtitle timings from script (length: {len(script_text)} chars)...")
-                    # Use the same voice that was used for the main audio
+                    # Convert dict back to object-like structure for the subtitle function
+                    class AlignmentData:
+                        def __init__(self, data):
+                            self.characters = data.get('characters', [])
+                            self.character_start_times_seconds = data.get('character_start_times_seconds', [])
+                            self.character_end_times_seconds = data.get('character_end_times_seconds', [])
+
+                    alignment_obj = AlignmentData(request.alignment)
+
+                    if create_ass_from_elevenlabs_alignment:
+                        ass_content = create_ass_from_elevenlabs_alignment(script_text, alignment_obj, audio_duration)
+                        subtitle_path = temp_path / "subtitles.ass"
+                        with open(subtitle_path, 'w', encoding='utf-8') as f:
+                            f.write(ass_content)
+                        print(f"✓ Created ASS subtitles from ElevenLabs alignment")
+                    else:
+                        print(f"⚠ ElevenLabs subtitle function not available, using fallback")
+                        ass_content = create_ass_fallback(script_text, audio_duration)
+                        subtitle_path = temp_path / "subtitles.ass"
+                        with open(subtitle_path, 'w', encoding='utf-8') as f:
+                            f.write(ass_content)
+                except Exception as e:
+                    print(f"⚠ Failed to generate ElevenLabs subtitles: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fall through to Google TTS fallback
+
+            # Fallback to Google TTS for subtitle timing
+            if subtitle_path is None and TTS_AVAILABLE and tts_client and request.script:
+                try:
+                    print(f"📝 Generating subtitle timings from Google TTS (length: {len(script_text)} chars)...")
                     selected_voice = request.voice_name if request.voice_name else "en-US-Neural2-H"
                     _, timepoints = generate_tts_with_timing(script_text, voice_name=selected_voice)
-                    
+
                     if timepoints:
-                        print(f"   Received {len(timepoints)} timepoints from TTS")
-                        # Create professional ASS subtitle file with karaoke effects
-                        # Use the EXACT same script_text that was used for TTS
+                        print(f"   Received {len(timepoints)} timepoints from Google TTS")
                         if create_ass_from_timepoints:
                             ass_content = create_ass_from_timepoints(script_text, timepoints, audio_duration, style="3words")
                             subtitle_path = temp_path / "subtitles.ass"
                             with open(subtitle_path, 'w', encoding='utf-8') as f:
                                 f.write(ass_content)
-                            print(f"✓ Created professional ASS subtitle file (3 words max per line) with {len(timepoints)} timepoints")
+                            print(f"✓ Created ASS subtitles from Google TTS timepoints")
                         else:
-                            # Fallback to SRT if ASS functions not available
                             srt_content = create_srt_from_timepoints(script_text, timepoints, audio_duration, style="3words")
                             subtitle_path = temp_path / "subtitles.srt"
                             with open(subtitle_path, 'w', encoding='utf-8') as f:
                                 f.write(srt_content)
-                            print(f"✓ Created SRT subtitle file (3 words per caption) with {len(timepoints)} timepoints")
+                            print(f"✓ Created SRT subtitles from Google TTS timepoints")
                     else:
-                        print(f"⚠ No timepoints received, creating estimated subtitles")
-                        # Fallback: create simple ASS subtitles with even timing
+                        print(f"⚠ No Google TTS timepoints, using fallback timing")
                         if create_ass_fallback:
                             ass_content = create_ass_fallback(script_text, audio_duration)
                             subtitle_path = temp_path / "subtitles.ass"
                             with open(subtitle_path, 'w', encoding='utf-8') as f:
                                 f.write(ass_content)
-                        else:
-                            # Fallback to SRT if ASS functions not available
-                            srt_content = create_srt_fallback(script_text, audio_duration)
-                            subtitle_path = temp_path / "subtitles.srt"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(srt_content)
                 except Exception as e:
-                    print(f"⚠ Failed to generate subtitles with timing: {e}")
-                    # Fallback: create simple subtitles
-                    try:
-                        if create_ass_fallback:
-                            ass_content = create_ass_fallback(script_text, audio_duration)
-                            subtitle_path = temp_path / "subtitles.ass"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(ass_content)
-                        else:
-                            # Fallback to SRT if ASS functions not available
-                            srt_content = create_srt_fallback(script_text, audio_duration)
-                            subtitle_path = temp_path / "subtitles.srt"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(srt_content)
-                    except:
-                        subtitle_path = None
+                    print(f"⚠ Failed to generate Google TTS subtitles: {e}")
+
+            # Final fallback: even timing
+            if subtitle_path is None and request.script:
+                try:
+                    print(f"📝 Using fallback even timing for subtitles...")
+                    if create_ass_fallback:
+                        ass_content = create_ass_fallback(script_text, audio_duration)
+                        subtitle_path = temp_path / "subtitles.ass"
+                        with open(subtitle_path, 'w', encoding='utf-8') as f:
+                            f.write(ass_content)
+                        print(f"✓ Created fallback ASS subtitles")
+                except Exception as e:
+                    print(f"⚠ Failed to create fallback subtitles: {e}")
+                    subtitle_path = None
             
             
             # Step 2.5: Verify concatenated video duration and extend if needed

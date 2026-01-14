@@ -1,328 +1,333 @@
 import re
 import json
+from typing import List, Dict, Tuple
 from fastapi import HTTPException
-from models import ScriptRequest, ScriptResponse, VideoScene
+from models import ScriptRequest, ScriptResponse, VideoScene, ScriptSection
 from config import openai_client
+
 
 def sanitize_search_query(query: str) -> str:
     """
-    Remove proper nouns (capitalized words that look like names) from search queries 
-    to make them stock-video-friendly. Keeps only generic terms.
+    Remove proper nouns and optimize for stock video API searches.
+    Pexels and Pixabay work best with simple, generic terms.
     """
     if not query:
         return query
-    
+
     words = query.split()
+
+    # Words to remove (articles, prepositions, etc.)
+    stop_words = {'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'is', 'are', 'was', 'were'}
+
     # Common capitalized words that are generic (not names)
     common_generic_caps = {
         'basketball', 'football', 'soccer', 'tennis', 'baseball', 'hockey',
         'beach', 'ocean', 'mountain', 'city', 'street', 'park', 'forest',
         'sunset', 'sunrise', 'night', 'day', 'morning', 'evening',
-        'person', 'people', 'crowd', 'team', 'player', 'athlete'
+        'person', 'people', 'crowd', 'team', 'player', 'athlete',
+        'money', 'cash', 'dollar', 'business', 'office', 'computer'
     }
-    
-    generic_words = []
+
+    generic_words: List[str] = []
     for word in words:
         word_lower = word.lower()
+
+        # Skip stop words
+        if word_lower in stop_words:
+            continue
+
         # If word is capitalized and not in our common generic list, it's likely a name
         if word and word[0].isupper() and len(word) > 1 and word_lower not in common_generic_caps:
-            # This looks like a proper noun/name, skip it
             continue
-        # Keep the word (convert to lowercase for consistency)
+
         generic_words.append(word_lower)
-    
-    # If we filtered out everything, use a fallback - just lowercase everything
-    if not generic_words:
-        return ' '.join(w.lower() for w in words if w)
-    
-    return ' '.join(generic_words)
 
-async def generate_script(request: ScriptRequest) -> ScriptResponse:
-    """
-    Generate a 30-second edgy, controversial video script with 4 scenes.
-    """
-    if not request.topic or not request.topic.strip():
-        raise HTTPException(status_code=400, detail="Topic is required")
+    # Limit to 4 words max for best API results
+    result = ' '.join(generic_words[:4])
 
-    # System prompt for 30-second edgy, controversial video script
-    system_prompt = """You are a script writer creating 30-second TikTok-length videos. Make them as EDGY and CONTROVERSIAL as possible about the given topic.
+    # If we filtered out everything, use a fallback
+    if not result:
+        return ' '.join(w.lower() for w in words[:4] if w)
+
+    return result
+
+
+def parse_script_sections(raw_script: str) -> Tuple[Dict[str, str], List[ScriptSection], str]:
+    """
+    Parse the raw script into sections (HOOK, BODY 1-4).
+    Returns:
+    - sections dict: {section_name: text}
+    - section_list: List of ScriptSection with word boundaries
+    - clean_script: The script without labels for TTS
+    """
+    sections: Dict[str, str] = {}
+
+    # Pattern to match section headers like "HOOK:", "BODY 1:", etc.
+    pattern = r'(HOOK|BODY\s*\d?):\s*'
+
+    # Split by section headers while keeping the headers
+    parts = re.split(pattern, raw_script, flags=re.IGNORECASE)
+
+    # Process parts - they come as [before, header1, content1, header2, content2, ...]
+    current_header = None
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Check if this is a header
+        if re.match(r'^(HOOK|BODY\s*\d?)$', part, re.IGNORECASE):
+            current_header = part.upper().replace(' ', '')  # Normalize: "BODY 1" -> "BODY1"
+        elif current_header:
+            sections[current_header] = part
+            current_header = None
+
+    # Build clean script and track word boundaries
+    ordered_sections = ['HOOK', 'BODY1', 'BODY2', 'BODY3', 'BODY4']
+    script_parts: List[str] = []
+    section_list: List[ScriptSection] = []
+    current_word_index = 0
+
+    for section_name in ordered_sections:
+        if section_name in sections:
+            text = sections[section_name]
+            word_count = len(text.split())
+
+            section_list.append(ScriptSection(
+                name=section_name,
+                text=text,
+                word_start=current_word_index,
+                word_end=current_word_index + word_count
+            ))
+
+            script_parts.append(text)
+            current_word_index += word_count
+
+    clean_script = ' '.join(script_parts)
+
+    print(f"✓ Parsed {len(sections)} script sections: {list(sections.keys())}")
+    print(f"✓ Section boundaries:")
+    for s in section_list:
+        print(f"   {s.name}: words {s.word_start}-{s.word_end} ({s.word_end - s.word_start} words)")
+
+    return sections, section_list, clean_script
+
+
+async def generate_script_text(topic: str) -> str:
+    """
+    Generate the raw script text with section labels.
+    """
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="OpenAI client not available")
+
+    system_prompt = """You are a script writer creating 30 to 60-second TikTok-length videos. You want them to go viral so they must be edgy and engaging.
+
 CRITICAL REQUIREMENTS:
-- Start with a CRISP HOOK that grabs attention immediately
-- DO RESEARCH and provide ACTUAL FACTS and little-known information that people wouldn't know
-- Every sentence must be a STATEMENT OF FACT - NO questions whatsoever
-- Every sentence should build on the previous ones, creating a chain of controversial revelations
-- NO dashes (use commas or periods instead - Google TTS doesn't pause properly for dashes)
-- NO question marks - only statements of fact
-- Spout EDGY, CONTROVERSIAL, and obscure facts/ideas about the topic
-- NO call-to-action, NO "find out more", NO "learn anything new" - just pure edgy information dumping
-- Pack it with crazy, interesting, provocative statements - make it as controversial as possible
-- Script should be exactly 30 seconds when spoken at normal pace
-- Write ONLY the raw spoken script - no quotes, no visual descriptions, no stage directions, no speaker names
-- Output pure dialogue/narration only
+- The script should have a story-like structure with a hook at the start and then each idea shared after building upon the earlier ones.
+- The hook must be immediately ENGAGING and ENTERTAINING -- start with the strongest piece of content that will draw in the viewer.
+- The rest of the script should consist of facts that are engaging, surprising, little-known, or controversial.
+- The response should use a casual, conversational tone as if spoken by a charismatic person and should contain NO dashes or questions.
+- There should be NO call to action at the end, NO questions, and NO invitation to learn more.
+- The final script must be between 80 and 120 words in length (about 30-60 seconds when spoken).
 
-Provide exactly 4 video scenes formatted as a JSON array. Each scene needs:
-- scene_number: 1-4
-- description: Visual content description (generic, stock-video-friendly)
-- search_keywords: Comma-separated generic keywords
-- search_query: 3-5 word generic search query for stock video APIs (NO specific names/brands/celebrities, NO filler words like 'a', 'the'). Example: "basketball player court" not "Ricky Rubio basketball"."""
+OUTPUT FORMAT:
+- Return only the script text in the below format with no additional commentary or text:
 
-    # Generate script using OpenAI with structured output
-    user_message = f"""Create a 30-second TikTok-length video script about: {request.topic}.
+HOOK:
+[Engaging hook text here: 2-4 sentences]
 
-DO RESEARCH and find ACTUAL FACTS and little-known information about this topic that people wouldn't know. Make it as EDGY and CONTROVERSIAL as possible.
+BODY 1:
+[Engaging connected body idea here: 2-4 sentences]
 
-CRITICAL FORMATTING RULES:
-- Start with a crisp hook, then spout crazy, edgy, little-known facts for 30 seconds
-- NO dashes - use commas or periods instead (dashes don't work with TTS)
-- NO questions - every sentence must be a statement of fact
-- Every sentence should build on the previous ones, revealing controversial facts
-- No learning, no discovery, no call-to-action - just pure provocative information dumping
-- Write ONLY statements of fact, one building on the next
+BODY 2:
+[Another interesting body idea here: 2-4 sentences]
 
-Output format:
-SCRIPT:
-[Raw spoken script only - no descriptions, no formatting, no dashes, no questions]
+BODY 3:
+[Something slightly controversial as well here: 2-4 sentences]
 
-SCENES:
-[JSON array with exactly 4 scenes, each with scene_number (1-4), description, search_keywords (comma-separated), search_query (3-5 generic words, no names/brands/celebrities)]"""
+BODY 4:
+[Another closing body idea here if needed: 2-4 sentences]"""
+
+    user_message = f"""Create a 30 to 60-second TikTok video script about: {topic}"""
+
+    print(f"🎬 Generating script for topic: {topic}")
 
     response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
         temperature=0.8,
-        max_tokens=1500
+        max_tokens=800
     )
 
-    response_content = response.choices[0].message.content
-
-    if not response_content:
-        raise HTTPException(status_code=500, detail="Failed to generate script")
-
-    # Debug: Print the raw response to see what we're getting
-    print(f"📝 Raw AI response (first 1000 chars): {response_content[:1000]}")
-
-    # Parse the response to extract script and scenes
-    script = ""
-    scenes = []
-
-    # Try to split by SCRIPT: and SCENES: markers (case-insensitive)
-    script_marker = "SCRIPT:" if "SCRIPT:" in response_content else "script:" if "script:" in response_content else None
-    scenes_marker = "SCENES:" if "SCENES:" in response_content else "scenes:" if "scenes:" in response_content else None
-    
-    if script_marker and scenes_marker:
-        # Split by scenes marker (case-insensitive)
-        parts = re.split(r'SCENES?:', response_content, flags=re.IGNORECASE)
-        if len(parts) >= 2:
-            script = parts[0].replace("SCRIPT:", "").replace("script:", "").strip()
-            # Remove any quotes that might wrap the script
-            script = script.strip('"').strip("'").strip('`').strip()
-            scenes_text = parts[1].strip()
-        else:
-            scenes_text = ""
-            script = response_content
-        
-        # Try to extract JSON from the scenes text
-        if scenes_text:
-            try:
-                scenes_data = []
-                
-                # First try: Find JSON array in the text - try multiple patterns
-                json_match = re.search(r'\[.*?\]', scenes_text, re.DOTALL)
-                if not json_match:
-                    # Try to find JSON that might be wrapped in code blocks
-                    code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', scenes_text, re.DOTALL)
-                    if code_block_match:
-                        json_match = code_block_match
-                        json_str = code_block_match.group(1)
-                    else:
-                        # Try to find JSON array that spans multiple lines
-                        json_match = re.search(r'\[[\s\S]*?\]', scenes_text)
-                
-                if json_match:
-                    json_str = json_match.group() if hasattr(json_match, 'group') else json_match
-                    if isinstance(json_str, re.Match):
-                        json_str = json_str.group()
-                    try:
-                        scenes_data = json.loads(json_str)
-                        print(f"✓ Successfully parsed {len(scenes_data)} scenes from JSON")
-                    except json.JSONDecodeError as e:
-                        print(f"⚠ JSON parse error: {e}")
-                        print(f"   JSON string: {json_str[:200]}")
-                        scenes_data = []
-                else:
-                    # Second try: Parse numbered list format
-                    scenes_data = []
-                    
-                    # Split by numbered items (1., 2., 3., etc.)
-                    scene_blocks = re.split(r'^\d+\.\s*\n?', scenes_text, flags=re.MULTILINE)
-                    
-                    for block in scene_blocks:
-                        if not block.strip():
-                            continue
-                        
-                        scene_obj = {}
-                        # Extract description
-                        desc_match = re.search(r'[-•]\s*description:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                        if desc_match:
-                            scene_obj['description'] = desc_match.group(1).strip()
-                        else:
-                            desc_match = re.search(r'description:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if desc_match:
-                                scene_obj['description'] = desc_match.group(1).strip()
-                        
-                        # Extract search_keywords
-                        keywords_match = re.search(r'[-•]\s*search_keywords:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                        if keywords_match:
-                            scene_obj['search_keywords'] = keywords_match.group(1).strip()
-                        else:
-                            keywords_match = re.search(r'search_keywords:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if keywords_match:
-                                scene_obj['search_keywords'] = keywords_match.group(1).strip()
-                        
-                        # Extract search_query
-                        query_match = re.search(r'[-•]\s*search_query:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                        if query_match:
-                            scene_obj['search_query'] = query_match.group(1).strip()
-                        else:
-                            query_match = re.search(r'search_query:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.MULTILINE)
-                            if query_match:
-                                scene_obj['search_query'] = query_match.group(1).strip()
-                        
-                        # Only add if we have at least a description
-                        if scene_obj.get('description'):
-                            if 'scene_number' not in scene_obj:
-                                scene_obj['scene_number'] = len(scenes_data) + 1
-                            scenes_data.append(scene_obj)
-                    
-                    # If we still don't have scenes, try line-by-line parsing
-                    if not scenes_data:
-                        lines = scenes_text.split('\n')
-                        current_scene = {}
-                        scene_num = 1
-                        
-                        for line in lines:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            
-                            # Check if this is a new scene (starts with number)
-                            num_match = re.match(r'^(\d+)\.', line)
-                            if num_match:
-                                if current_scene.get('description'):
-                                    current_scene['scene_number'] = scene_num
-                                    scenes_data.append(current_scene)
-                                    scene_num += 1
-                                current_scene = {}
-                                continue
-                            
-                            # Parse key-value pairs with optional dash/bullet
-                            if ':' in line:
-                                line_clean = re.sub(r'^[-•]\s*', '', line)
-                                key, value = line_clean.split(':', 1)
-                                key = key.strip().lower().replace('-', '').replace('_', '')
-                                value = value.strip()
-                                
-                                if 'description' in key:
-                                    current_scene['description'] = value
-                                elif 'searchkeywords' in key or 'keywords' in key:
-                                    current_scene['search_keywords'] = value
-                                elif 'searchquery' in key or 'query' in key:
-                                    current_scene['search_query'] = value
-                        
-                        # Add last scene
-                        if current_scene.get('description'):
-                            current_scene['scene_number'] = scene_num
-                            scenes_data.append(current_scene)
-                
-                # Process scenes_data if we found any
-                if scenes_data:
-                    # Ensure we have a list
-                    if not isinstance(scenes_data, list):
-                        scenes_data = [scenes_data]
-                    
-                    # Ensure each scene has all required fields
-                    for idx, scene_data in enumerate(scenes_data):
-                        # Set scene_number if missing
-                        if 'scene_number' not in scene_data:
-                            scene_data['scene_number'] = idx + 1
-                        
-                        if 'search_query' not in scene_data or not scene_data.get('search_query'):
-                            # Generate search_query from description if missing
-                            desc = scene_data.get('description', '')
-                            if desc:
-                                words = desc.split()[:5]
-                                scene_data['search_query'] = ' '.join(words)
-                        else:
-                            # Sanitize the search query to remove proper nouns
-                            scene_data['search_query'] = sanitize_search_query(scene_data.get('search_query', ''))
-                        if 'search_keywords' not in scene_data or not scene_data.get('search_keywords'):
-                            scene_data['search_keywords'] = scene_data.get('search_query', '')
-                    scenes = [VideoScene(**scene) for scene in scenes_data]
-                else:
-                    print(f"Could not parse scenes from text. First 500 chars: {scenes_text[:500]}")
-            except json.JSONDecodeError as e:
-                print(f"JSON decode error: {e}")
-                print(f"Scenes text snippet: {scenes_text[:500] if 'scenes_text' in locals() else 'N/A'}...")
-                scenes = []
-            except Exception as e:
-                print(f"Error parsing scenes: {e}")
-                import traceback
-                traceback.print_exc()
-                print(f"Scenes text snippet: {scenes_text[:500] if 'scenes_text' in locals() else 'N/A'}...")
-                scenes = []
-    elif script_marker:
-        # Only script marker found, try to extract script
-        parts = re.split(r'SCRIPT?:', response_content, flags=re.IGNORECASE)
-        script = parts[-1].strip().strip('"').strip("'").strip('`').strip()
-        scenes_text = ""
-    else:
-        # Fallback: use entire response as script if format is wrong
-        script = response_content.strip()
-        scenes_text = ""
-        # Try to find JSON array anywhere in the response
-        json_match = re.search(r'\[.*?\]', response_content, re.DOTALL)
-        if json_match:
-            try:
-                json_str = json_match.group()
-                scenes_data = json.loads(json_str)
-                print(f"✓ Found JSON array in response, parsed {len(scenes_data)} scenes")
-                for scene_data in scenes_data:
-                    try:
-                        scene = VideoScene(**scene_data)
-                        scenes.append(scene)
-                    except Exception as e:
-                        print(f"⚠ Error creating scene object: {e}")
-            except json.JSONDecodeError:
-                print(f"⚠ Could not parse JSON array from response")
-
+    script = response.choices[0].message.content
     if not script:
         raise HTTPException(status_code=500, detail="Failed to generate script")
 
-    # Debug: Print what we found
-    print(f"📊 Parsed {len(scenes)} scenes from response")
-    if len(scenes) > 0:
-        print(f"   First scene: {scenes[0].dict() if hasattr(scenes[0], 'dict') else scenes[0]}")
+    script = script.strip().strip('"').strip("'").strip('`').strip()
 
-    # Validate scenes - if we don't have 4 valid scenes, raise an error instead of using placeholders
-    if len(scenes) != 4:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate scenes. Expected 4 scenes but got {len(scenes)}. The AI response format may be incorrect. Check backend logs for details."
+    print(f"✓ Raw script generated ({len(script.split())} words)")
+
+    return script
+
+
+async def generate_scene_for_section(section: ScriptSection, scene_number: int) -> VideoScene:
+    """
+    Generate a single scene based on a script section.
+    Optimized for Pexels/Pixabay API searches.
+    """
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="OpenAI client not available")
+
+    system_prompt = """You are a stock video search expert. Your job is to create the BEST search query to find relevant stock footage on Pexels or Pixabay.
+
+CRITICAL RULES FOR STOCK VIDEO SEARCHES:
+- Use 2-4 simple, generic English words
+- Focus on VISUAL elements that can be filmed (actions, objects, settings)
+- NO abstract concepts, emotions, or ideas that can't be visually shown
+- NO proper nouns, brand names, or specific people
+- NO adjectives unless they describe something visual (like "dark", "bright", "slow")
+- Think: what would a videographer actually film?
+
+GOOD EXAMPLES:
+- "person typing laptop" (visual action)
+- "money falling slow motion" (filmable)
+- "city skyline night" (visual scene)
+- "hands holding phone" (specific visual)
+
+BAD EXAMPLES:
+- "controversial business practices" (too abstract)
+- "shocking revelation" (not visual)
+- "surprising facts about money" (can't film "surprising")"""
+
+    user_message = f"""Script section ({section.name}):
+"{section.text}"
+
+Create a stock video search query (2-4 words) that shows something VISUAL related to this content.
+
+Respond with ONLY a JSON object:
+{{"description": "brief visual description", "search_query": "2-4 word search"}}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        temperature=0.5,
+        max_tokens=150
+    )
+
+    response_content = response.choices[0].message.content
+    if not response_content:
+        # Fallback
+        return VideoScene(
+            scene_number=scene_number,
+            description=section.text[:100],
+            search_keywords="person talking camera",
+            search_query="person talking camera",
+            section_name=section.name,
+            word_start=section.word_start,
+            word_end=section.word_end
         )
 
-    # Validate each scene has required fields and sanitize search queries
-    for scene in scenes:
-        if not scene.search_query:
-            # Generate search_query from description if missing
-            words = scene.description.split()[:5]
-            scene.search_query = ' '.join(words)
-        else:
-            # Sanitize the search query to remove proper nouns
-            scene.search_query = sanitize_search_query(scene.search_query)
-        if not scene.search_keywords:
-            scene.search_keywords = scene.search_query
+    try:
+        # Parse JSON response
+        json_match = re.search(r'\{[\s\S]*\}', response_content)
+        if json_match:
+            data = json.loads(json_match.group())
+            search_query = sanitize_search_query(data.get('search_query', ''))
 
-    return ScriptResponse(script=script, scenes=scenes)
+            return VideoScene(
+                scene_number=scene_number,
+                description=data.get('description', section.text[:100]),
+                search_keywords=search_query,
+                search_query=search_query,
+                section_name=section.name,
+                word_start=section.word_start,
+                word_end=section.word_end
+            )
+    except Exception as e:
+        print(f"⚠ Error parsing scene response: {e}")
+
+    # Fallback
+    return VideoScene(
+        scene_number=scene_number,
+        description=section.text[:100],
+        search_keywords="person talking camera",
+        search_query="person talking camera",
+        section_name=section.name,
+        word_start=section.word_start,
+        word_end=section.word_end
+    )
+
+
+async def generate_scenes_from_sections(section_list: List[ScriptSection]) -> List[VideoScene]:
+    """
+    Generate scenes for each script section.
+    Each scene includes word boundary info for timing.
+    """
+    scenes: List[VideoScene] = []
+
+    # We need 4 scenes - use HOOK, BODY1, BODY2, and either BODY3 or BODY4
+    # Priority: HOOK, BODY1, BODY2, BODY3 (or BODY4 if BODY3 missing)
+    section_priority = ['HOOK', 'BODY1', 'BODY2', 'BODY3', 'BODY4']
+
+    # Create a map for quick lookup
+    section_map = {s.name: s for s in section_list}
+
+    scene_num = 1
+    for section_name in section_priority:
+        if section_name in section_map and scene_num <= 4:
+            section = section_map[section_name]
+            print(f"   Generating scene {scene_num} from {section_name} (words {section.word_start}-{section.word_end})...")
+
+            scene = await generate_scene_for_section(section, scene_num)
+            scenes.append(scene)
+
+            print(f"   ✓ Scene {scene_num}: \"{scene.search_query}\"")
+            scene_num += 1
+
+    return scenes
+
+
+async def generate_script(request: ScriptRequest) -> ScriptResponse:
+    """
+    Generate a video script with scenes and section timing info.
+    1. Generate raw script with section labels
+    2. Parse sections and calculate word boundaries
+    3. Generate optimized scene searches for each section
+    4. Return clean script (no labels) + scenes with word boundaries + section list
+    """
+    if not request.topic or not request.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic is required")
+
+    topic = request.topic.strip()
+
+    # Step 1: Generate the raw script with section labels
+    raw_script = await generate_script_text(topic)
+
+    # Step 2: Parse into sections with word boundaries
+    sections_dict, section_list, clean_script = parse_script_sections(raw_script)
+
+    if len(section_list) < 4:
+        print(f"⚠ Only got {len(section_list)} sections, expected 5. Raw script:\n{raw_script[:500]}")
+
+    # Step 3: Generate scenes from sections (with word boundary info)
+    print("🎬 Generating scenes from script sections...")
+    scenes = await generate_scenes_from_sections(section_list)
+
+    print(f"\n✅ Script generation complete:")
+    print(f"   Clean script: {len(clean_script.split())} words")
+    print(f"   Sections: {len(section_list)}")
+    print(f"   Scenes: {len(scenes)}")
+    for scene in scenes:
+        print(f"   - Scene {scene.scene_number} ({scene.section_name}): words {scene.word_start}-{scene.word_end}, query=\"{scene.search_query}\"")
+
+    return ScriptResponse(
+        script=clean_script,
+        scenes=scenes,
+        sections=section_list
+    )

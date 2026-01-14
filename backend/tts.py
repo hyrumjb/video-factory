@@ -1,6 +1,6 @@
 import re
 import html
-from config import TTS_AVAILABLE, tts_client, texttospeech
+from config import TTS_AVAILABLE, tts_client, texttospeech, ELEVENLABS_AVAILABLE, elevenlabs_client
 
 def list_available_voices(language_code: str = "en-US"):
     """
@@ -172,3 +172,108 @@ def generate_tts_with_timing(text: str, voice_name: str = "en-US-Neural2-H"):
         except Exception as fallback_error:
             print(f"Fallback TTS also failed: {fallback_error}")
             raise
+
+
+def generate_elevenlabs_tts_with_timing(text: str, voice_id: str = "nPczCjzI2devNBz1zQrb"):
+    """
+    Generate TTS audio using ElevenLabs API with word-level timing.
+
+    Args:
+        text: Text to synthesize
+        voice_id: ElevenLabs voice ID (default: "Brian" - a natural male voice)
+                  Popular voices:
+                  - "nPczCjzI2devNBz1zQrb" = Brian (male, narration)
+                  - "21m00Tcm4TlvDq8ikWAM" = Rachel (female, calm)
+                  - "EXAVITQu4vr4xnSDxMaL" = Bella (female, soft)
+                  - "ErXwobaYiN019PkySvjV" = Antoni (male, well-rounded)
+                  - "pNInz6obpgDQGcFmaJgB" = Adam (male, deep)
+
+    Returns:
+        Tuple of (audio_content bytes, alignment data with word timings)
+    """
+    if not ELEVENLABS_AVAILABLE or not elevenlabs_client:
+        raise RuntimeError("ElevenLabs is not available. Check API key and elevenlabs package.")
+
+    try:
+        # Generate audio with timestamps using ElevenLabs
+        response = elevenlabs_client.text_to_speech.convert_with_timestamps(
+            voice_id=voice_id,
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            output_format="mp3_44100_128",
+        )
+
+        # Extract audio bytes and alignment data
+        import base64
+        audio_content = base64.b64decode(response.audio_base_64)
+        alignment = response.alignment
+
+        print(f"✓ ElevenLabs TTS generated: {len(audio_content)} bytes")
+        if alignment and hasattr(alignment, 'characters'):
+            print(f"✓ ElevenLabs alignment data: {len(alignment.characters)} characters with timing")
+
+        return audio_content, alignment
+
+    except Exception as e:
+        print(f"ElevenLabs TTS with timing error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def generate_elevenlabs_tts(text: str, voice_id: str = "nPczCjzI2devNBz1zQrb") -> bytes:
+    """
+    Generate TTS audio using ElevenLabs API (without timing - for backward compatibility).
+
+    Args:
+        text: Text to synthesize
+        voice_id: ElevenLabs voice ID
+
+    Returns:
+        Audio content as bytes (MP3 format)
+    """
+    if not ELEVENLABS_AVAILABLE or not elevenlabs_client:
+        raise RuntimeError("ElevenLabs is not available. Check API key and elevenlabs package.")
+
+    try:
+        # Generate audio using ElevenLabs
+        audio_generator = elevenlabs_client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            output_format="mp3_44100_128",
+        )
+
+        # Collect all audio chunks into bytes
+        audio_chunks = []
+        for chunk in audio_generator:
+            audio_chunks.append(chunk)
+
+        audio_content = b''.join(audio_chunks)
+        print(f"✓ ElevenLabs TTS generated: {len(audio_content)} bytes")
+
+        return audio_content
+
+    except Exception as e:
+        print(f"ElevenLabs TTS error: {e}")
+        raise
+
+
+def list_elevenlabs_voices():
+    """List available ElevenLabs voices."""
+    if not ELEVENLABS_AVAILABLE or not elevenlabs_client:
+        return []
+
+    try:
+        response = elevenlabs_client.voices.get_all()
+        voices = []
+        for voice in response.voices:
+            voices.append({
+                'voice_id': voice.voice_id,
+                'name': voice.name,
+                'category': voice.category,
+            })
+        return voices
+    except Exception as e:
+        print(f"Error listing ElevenLabs voices: {e}")
+        return []

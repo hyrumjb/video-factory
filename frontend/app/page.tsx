@@ -2,7 +2,16 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import Header from './components/Header';
+import Link from 'next/link';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 export default function Home() {
   const [topic, setTopic] = useState('');
@@ -11,8 +20,8 @@ export default function Home() {
   const router = useRouter();
 
   const voices = [
-    { name: 'en-AU-Neural2-A', label: 'Female', starred: false },
-    { name: 'en-AU-Neural2-B', label: 'Male', starred: false },
+    { name: 'en-AU-Neural2-A', label: 'Female' },
+    { name: 'en-AU-Neural2-B', label: 'Male' },
   ];
 
   const placeholders = [
@@ -27,7 +36,6 @@ export default function Home() {
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
-    // Don't animate if user is typing
     if (topic.trim().length > 0) {
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
@@ -38,42 +46,36 @@ export default function Home() {
 
     const type = () => {
       const currentPlaceholder = placeholders[currentIndexRef.current];
-      
+
       if (isDeletingRef.current) {
-        // Delete one character
         currentTextRef.current = currentPlaceholder.substring(0, currentTextRef.current.length - 1);
         setPlaceholder(currentTextRef.current);
-        
+
         if (currentTextRef.current === '') {
           isDeletingRef.current = false;
           currentIndexRef.current = (currentIndexRef.current + 1) % placeholders.length;
-          timeoutRef.current = setTimeout(type, 300); // Pause before typing next
+          timeoutRef.current = setTimeout(type, 300);
         } else {
-          timeoutRef.current = setTimeout(type, 30); // Faster delete speed
+          timeoutRef.current = setTimeout(type, 30);
         }
       } else {
-        // Type one character
         const nextChar = currentPlaceholder[currentTextRef.current.length];
         currentTextRef.current = currentPlaceholder.substring(0, currentTextRef.current.length + 1);
         setPlaceholder(currentTextRef.current);
-        
+
         if (currentTextRef.current === currentPlaceholder) {
-          // Finished typing, wait 6 seconds then start deleting
           timeoutRef.current = setTimeout(() => {
             isDeletingRef.current = true;
             type();
           }, 6000);
         } else {
-          // Check if next character is a space (word boundary)
           const isWordBoundary = nextChar === ' ' || nextChar === '.';
-          // Fast typing for letters, pause after words
-          const delay = isWordBoundary ? 200 : 60; // 200ms pause after word, 60ms per letter
+          const delay = isWordBoundary ? 200 : 60;
           timeoutRef.current = setTimeout(type, delay);
         }
       }
     };
 
-    // Start typing
     type();
 
     return () => {
@@ -87,63 +89,61 @@ export default function Home() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!topic.trim()) return;
-    
-    // Store topic and selected voice in sessionStorage
+
     if (typeof window !== 'undefined') {
       sessionStorage.setItem('pendingTopic', topic.trim());
       sessionStorage.setItem('selectedVoice', selectedVoice);
     }
-    
-    // Navigate immediately without transition
+
     router.push('/results');
   };
 
   return (
-    <div className="min-h-screen bg-white flex flex-col items-center justify-center relative">
-      <Header />
+    <div className="min-h-screen bg-background flex flex-col">
+      {/* Header */}
+      <header className="fixed top-0 left-0 right-0 z-50 px-6 py-4 bg-background/80 backdrop-blur-sm border-b">
+        <Link href="/" className="text-lg font-medium hover:opacity-80 transition-opacity">
+          Studio Nine
+        </Link>
+      </header>
 
       {/* Main content */}
-      <div className="flex flex-col items-center justify-center w-full max-w-2xl px-6 py-20">
-        <h2 className="text-gray-900 text-4xl md:text-5xl mb-12 text-center tracking-tight" style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontWeight: 500, letterSpacing: '-0.75px', lineHeight: '46px', fontSize: '56px' }}>
-          Create beautiful videos with zero effort
-        </h2>
+      <main className="flex-1 flex flex-col items-center justify-center px-6 pt-20 pb-10">
+        <div className="w-full max-w-xl space-y-8">
+          <h1 className="text-3xl md:text-4xl font-medium text-center tracking-tight">
+            Create beautiful videos with zero effort
+          </h1>
 
-        <form onSubmit={handleSubmit} className="w-full">
-          <div className="relative">
-            <textarea
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <Textarea
               value={topic}
               onChange={(e) => setTopic(e.target.value)}
               placeholder={topic ? '' : placeholder}
               rows={4}
-              className="w-full px-6 py-5 pr-24 bg-gray-200 text-gray-900 text-lg rounded-2xl border-none outline-none placeholder-gray-500 resize-none transition-all duration-300 hover:bg-gray-300 focus:bg-gray-300 focus:ring-0 focus:outline-none"
-              style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontWeight: 300, boxShadow: 'none' }}
+              className="resize-none text-base"
             />
-            <div className="absolute bottom-4 right-4 flex items-center gap-3">
-              <select
-                value={selectedVoice}
-                onChange={(e) => setSelectedVoice(e.target.value)}
-                className="px-4 py-2.5 bg-white text-gray-900 text-sm font-medium rounded-lg border-0 outline-none focus:ring-2 focus:ring-gray-400 transition-colors"
-                style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                {voices.map((voice) => (
-                  <option key={voice.name} value={voice.name}>
-                    {voice.starred ? '⭐ ' : ''}{voice.label}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="submit"
-                disabled={!topic.trim()}
-                className="px-6 py-2.5 bg-gray-900 text-white text-sm font-medium rounded-xl disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200 hover:bg-gray-800 hover:scale-105 active:scale-95 focus:outline-none focus:ring-2 focus:ring-gray-900/20"
-                style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
-              >
+
+            <div className="flex items-center gap-3 justify-end">
+              <Select value={selectedVoice} onValueChange={setSelectedVoice}>
+                <SelectTrigger className="w-32">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {voices.map((voice) => (
+                    <SelectItem key={voice.name} value={voice.name}>
+                      {voice.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <Button type="submit" disabled={!topic.trim()}>
                 Generate
-              </button>
+              </Button>
             </div>
-          </div>
-        </form>
-      </div>
+          </form>
+        </div>
+      </main>
     </div>
   );
 }

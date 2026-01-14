@@ -7,3 +7,4 @@ python-multipart>=0.0.12
 google-cloud-texttospeech>=2.16.0
 requests>=2.31.0
 imageio-ffmpeg>=0.4.9
+elevenlabs>=1.0.0
