@@ -92,6 +92,7 @@ function ResultsContent() {
     if (typeof window === 'undefined') return;
 
     const topic = sessionStorage.getItem('pendingTopic');
+    const voiceId = sessionStorage.getItem('selectedVoice') || 'nPczCjzI2devNBz1zQrb';
 
     if (!topic) {
       router.push('/');
@@ -100,10 +101,11 @@ function ResultsContent() {
 
     hasStartedRef.current = true;
     sessionStorage.removeItem('pendingTopic');
+    sessionStorage.removeItem('selectedVoice');
 
-    // Create SSE connection
+    // Create SSE connection with topic and voice
     const eventSource = new EventSource(
-      `http://localhost:8000/api/create-video?topic=${encodeURIComponent(topic.trim())}`
+      `http://localhost:8000/api/create-video?topic=${encodeURIComponent(topic.trim())}&voice_id=${encodeURIComponent(voiceId)}`
     );
     eventSourceRef.current = eventSource;
 

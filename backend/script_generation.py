@@ -8,46 +8,54 @@ from config import openai_client
 
 def sanitize_search_query(query: str) -> str:
     """
-    Remove proper nouns and optimize for stock video API searches.
-    Pexels and Pixabay work best with simple, generic terms.
+    Clean and optimize search query for Pexels/Pixabay API.
+    Returns 1-3 simple, generic words that work well with stock video search.
     """
     if not query:
-        return query
+        return "people"
 
-    words = query.split()
+    # Convert to lowercase and split
+    words = query.lower().split()
 
-    # Words to remove (articles, prepositions, etc.)
-    stop_words = {'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'is', 'are', 'was', 'were'}
-
-    # Common capitalized words that are generic (not names)
-    common_generic_caps = {
-        'basketball', 'football', 'soccer', 'tennis', 'baseball', 'hockey',
-        'beach', 'ocean', 'mountain', 'city', 'street', 'park', 'forest',
-        'sunset', 'sunrise', 'night', 'day', 'morning', 'evening',
-        'person', 'people', 'crowd', 'team', 'player', 'athlete',
-        'money', 'cash', 'dollar', 'business', 'office', 'computer'
+    # Words to remove completely
+    stop_words = {
+        'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by',
+        'is', 'are', 'was', 'were', 'and', 'or', 'but', 'so', 'yet',
+        'this', 'that', 'these', 'those', 'it', 'its'
     }
 
-    generic_words: List[str] = []
+    # Abstract words that don't return good video results
+    abstract_words = {
+        'amazing', 'awesome', 'incredible', 'shocking', 'surprising',
+        'interesting', 'important', 'controversial', 'secret', 'hidden',
+        'unknown', 'famous', 'popular', 'successful', 'powerful',
+        'best', 'worst', 'top', 'ultimate', 'real', 'true', 'actual',
+        'fact', 'facts', 'truth', 'story', 'reason', 'reasons', 'way', 'ways'
+    }
+
+    # Filter words
+    clean_words: List[str] = []
     for word in words:
-        word_lower = word.lower()
+        # Remove punctuation
+        word = ''.join(c for c in word if c.isalnum())
 
-        # Skip stop words
-        if word_lower in stop_words:
+        if not word:
+            continue
+        if word in stop_words:
+            continue
+        if word in abstract_words:
+            continue
+        if len(word) < 2:
             continue
 
-        # If word is capitalized and not in our common generic list, it's likely a name
-        if word and word[0].isupper() and len(word) > 1 and word_lower not in common_generic_caps:
-            continue
+        clean_words.append(word)
 
-        generic_words.append(word_lower)
+    # Limit to 3 words max for best Pexels results
+    result = ' '.join(clean_words[:3])
 
-    # Limit to 4 words max for best API results
-    result = ' '.join(generic_words[:4])
-
-    # If we filtered out everything, use a fallback
+    # If we filtered out everything, use generic fallback
     if not result:
-        return ' '.join(w.lower() for w in words[:4] if w)
+        return "people"
 
     return result
 
@@ -123,30 +131,26 @@ async def generate_script_text(topic: str) -> str:
     system_prompt = """You are a script writer creating 30 to 60-second TikTok-length videos. You want them to go viral so they must be edgy and engaging.
 
 CRITICAL REQUIREMENTS:
-- The script should have a story-like structure with a hook at the start and then each idea shared after building upon the earlier ones.
-- The hook must be immediately ENGAGING and ENTERTAINING -- start with the strongest piece of content that will draw in the viewer.
-- The rest of the script should consist of facts that are engaging, surprising, little-known, or controversial.
-- The response should use a casual, conversational tone as if spoken by a charismatic person and should contain NO dashes or questions.
-- There should be NO call to action at the end, NO questions, and NO invitation to learn more.
-- The final script must be between 80 and 120 words in length (about 30-60 seconds when spoken).
+- The script MUST have exactly 4 sections: HOOK, BODY 1, BODY 2, and BODY 3
+- The hook must be immediately ENGAGING and ENTERTAINING -- start with the strongest piece of content
+- Each BODY section should build upon the previous one with engaging, surprising, or little-known facts
+- Use a casual, conversational tone as if spoken by a charismatic person
+- NO dashes, NO questions, NO call to action at the end
+- Total script: 80-120 words (30-60 seconds when spoken)
 
-OUTPUT FORMAT:
-- Return only the script text in the below format with no additional commentary or text:
+OUTPUT FORMAT (you MUST include all 4 sections):
 
 HOOK:
-[Engaging hook text here: 2-4 sentences]
+[2-3 sentences - the attention grabber]
 
 BODY 1:
-[Engaging connected body idea here: 2-4 sentences]
+[2-3 sentences - first key point]
 
 BODY 2:
-[Another interesting body idea here: 2-4 sentences]
+[2-3 sentences - second key point]
 
 BODY 3:
-[Something slightly controversial as well here: 2-4 sentences]
-
-BODY 4:
-[Another closing body idea here if needed: 2-4 sentences]"""
+[2-3 sentences - closing point or twist]"""
 
     user_message = f"""Create a 30 to 60-second TikTok video script about: {topic}"""
 
@@ -181,34 +185,39 @@ async def generate_scene_for_section(section: ScriptSection, scene_number: int) 
     if not openai_client:
         raise HTTPException(status_code=503, detail="OpenAI client not available")
 
-    system_prompt = """You are a stock video search expert. Your job is to create the BEST search query to find relevant stock footage on Pexels or Pixabay.
+    system_prompt = """You are a stock video search expert for Pexels API. Create search queries that return good results.
 
-CRITICAL RULES FOR STOCK VIDEO SEARCHES:
-- Use 2-4 simple, generic English words
-- Focus on VISUAL elements that can be filmed (actions, objects, settings)
-- NO abstract concepts, emotions, or ideas that can't be visually shown
-- NO proper nouns, brand names, or specific people
-- NO adjectives unless they describe something visual (like "dark", "bright", "slow")
-- Think: what would a videographer actually film?
+PEXELS SEARCH QUERY RULES:
+1. Use 1-3 simple, common English words
+2. Queries can be BROAD like: Nature, Tigers, People, Ocean, Money, City
+3. Or SPECIFIC like: Group of people working, Person typing laptop, Hands holding phone
+4. Focus on FILMABLE subjects: people, places, objects, actions
+5. NO abstract concepts (success, happiness, controversy, shocking)
+6. NO adjectives that aren't visual (surprising, interesting, controversial)
+7. NO proper nouns or brand names
 
-GOOD EXAMPLES:
-- "person typing laptop" (visual action)
-- "money falling slow motion" (filmable)
-- "city skyline night" (visual scene)
-- "hands holding phone" (specific visual)
+WHAT WORKS WELL ON PEXELS:
+- Single nouns: "money", "ocean", "city", "forest", "office", "phone"
+- Person + action: "person walking", "woman talking", "man working"
+- Object close-ups: "hands typing", "coffee cup", "phone screen"
+- Locations: "city street", "beach sunset", "office interior"
+- Nature: "ocean waves", "forest trees", "sky clouds"
 
-BAD EXAMPLES:
-- "controversial business practices" (too abstract)
-- "shocking revelation" (not visual)
-- "surprising facts about money" (can't film "surprising")"""
+WHAT DOESN'T WORK:
+- Abstract: "success story", "financial freedom", "shocking truth"
+- Too specific: "businessman in New York making deal"
+- Adjectives: "amazing sunset", "controversial topic"
+
+Pick the MOST VISUAL element from the script section."""
 
     user_message = f"""Script section ({section.name}):
 "{section.text}"
 
-Create a stock video search query (2-4 words) that shows something VISUAL related to this content.
+Create a Pexels search query (1-3 words) for stock video footage.
+Think: what would a videographer film to illustrate this?
 
 Respond with ONLY a JSON object:
-{{"description": "brief visual description", "search_query": "2-4 word search"}}"""
+{{"description": "what the video shows", "search_query": "1-3 word query"}}"""
 
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
@@ -222,12 +231,13 @@ Respond with ONLY a JSON object:
 
     response_content = response.choices[0].message.content
     if not response_content:
-        # Fallback
+        # Fallback based on section type
+        fallback_query = _get_fallback_query_for_section(section.name)
         return VideoScene(
             scene_number=scene_number,
             description=section.text[:100],
-            search_keywords="person talking camera",
-            search_query="person talking camera",
+            search_keywords=fallback_query,
+            search_query=fallback_query,
             section_name=section.name,
             word_start=section.word_start,
             word_end=section.word_end
@@ -252,43 +262,60 @@ Respond with ONLY a JSON object:
     except Exception as e:
         print(f"⚠ Error parsing scene response: {e}")
 
-    # Fallback
+    # Fallback based on section type
+    fallback_query = _get_fallback_query_for_section(section.name)
     return VideoScene(
         scene_number=scene_number,
         description=section.text[:100],
-        search_keywords="person talking camera",
-        search_query="person talking camera",
+        search_keywords=fallback_query,
+        search_query=fallback_query,
         section_name=section.name,
         word_start=section.word_start,
         word_end=section.word_end
     )
 
 
+def _get_fallback_query_for_section(section_name: str) -> str:
+    """Get a generic fallback query based on section type."""
+    fallbacks = {
+        "HOOK": "person talking",
+        "BODY1": "people working",
+        "BODY2": "city street",
+        "BODY3": "office interior",
+        "BODY4": "nature landscape",
+    }
+    return fallbacks.get(section_name, "people")
+
+
 async def generate_scenes_from_sections(section_list: List[ScriptSection]) -> List[VideoScene]:
     """
     Generate scenes for each script section.
     Each scene includes word boundary info for timing.
+    We expect 4 sections: HOOK, BODY1, BODY2, BODY3
     """
     scenes: List[VideoScene] = []
 
-    # We need 4 scenes - use HOOK, BODY1, BODY2, and either BODY3 or BODY4
-    # Priority: HOOK, BODY1, BODY2, BODY3 (or BODY4 if BODY3 missing)
+    # Expected sections in order
     section_priority = ['HOOK', 'BODY1', 'BODY2', 'BODY3', 'BODY4']
 
     # Create a map for quick lookup
     section_map = {s.name: s for s in section_list}
 
+    print(f"\n📝 Generating scenes for {len(section_list)} sections...")
+
     scene_num = 1
     for section_name in section_priority:
-        if section_name in section_map and scene_num <= 4:
+        if section_name in section_map:
             section = section_map[section_name]
-            print(f"   Generating scene {scene_num} from {section_name} (words {section.word_start}-{section.word_end})...")
+            print(f"   [{scene_num}] {section_name} (words {section.word_start}-{section.word_end})...")
 
             scene = await generate_scene_for_section(section, scene_num)
             scenes.append(scene)
 
-            print(f"   ✓ Scene {scene_num}: \"{scene.search_query}\"")
+            print(f"       → search query: \"{scene.search_query}\"")
             scene_num += 1
+
+    print(f"✅ Generated {len(scenes)} scenes\n")
 
     return scenes
 
@@ -310,16 +337,15 @@ async def generate_script(request: ScriptRequest) -> ScriptResponse:
     raw_script = await generate_script_text(topic)
 
     # Step 2: Parse into sections with word boundaries
-    sections_dict, section_list, clean_script = parse_script_sections(raw_script)
+    _, section_list, clean_script = parse_script_sections(raw_script)
 
     if len(section_list) < 4:
-        print(f"⚠ Only got {len(section_list)} sections, expected 5. Raw script:\n{raw_script[:500]}")
+        print(f"⚠ Only got {len(section_list)} sections, expected 4. Raw script:\n{raw_script[:500]}")
 
     # Step 3: Generate scenes from sections (with word boundary info)
-    print("🎬 Generating scenes from script sections...")
     scenes = await generate_scenes_from_sections(section_list)
 
-    print(f"\n✅ Script generation complete:")
+    print("✅ Script generation complete:")
     print(f"   Clean script: {len(clean_script.split())} words")
     print(f"   Sections: {len(section_list)}")
     print(f"   Scenes: {len(scenes)}")

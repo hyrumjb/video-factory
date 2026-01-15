@@ -58,9 +58,17 @@ class VideoCreationOrchestrator:
         self.max_retries = 2
         self.video_search_retries = 3
 
-    async def create_video(self, topic: str) -> AsyncGenerator[ProgressEvent, None]:
+    async def create_video(
+        self,
+        topic: str,
+        voice_id: str = "nPczCjzI2devNBz1zQrb"
+    ) -> AsyncGenerator[ProgressEvent, None]:
         """
         Main orchestration method. Yields progress events as SSE data.
+
+        Args:
+            topic: The video topic/prompt
+            voice_id: ElevenLabs voice ID (default: Brian)
         """
         script_response: Optional[ScriptResponse] = None
         audio_data: Optional[Dict[str, Any]] = None
@@ -101,7 +109,7 @@ class VideoCreationOrchestrator:
 
             # Run TTS and video search concurrently
             tts_task = asyncio.create_task(
-                self._generate_tts_with_fallback(script_response.script)
+                self._generate_tts_with_fallback(script_response.script, voice_id)
             )
             videos_task = asyncio.create_task(
                 self._search_videos_for_scenes(script_response.scenes)
@@ -120,15 +128,20 @@ class VideoCreationOrchestrator:
 
             # Report video search completion
             video_urls = [s["video_url"] for s in scenes_with_videos if s.get("video_url")]
+            total_scenes = len(script_response.scenes)
+
             yield ProgressEvent(
                 step="videos",
                 status=StepStatus.DONE,
-                message=f"Found {len(video_urls)} videos",
+                message=f"Found {len(video_urls)}/{total_scenes} videos",
                 data={"videos": scenes_with_videos}
             )
 
             if not video_urls:
-                raise Exception("No videos found for any scene")
+                raise Exception(f"No videos found for any of the {total_scenes} scenes")
+
+            if len(video_urls) < total_scenes:
+                print(f"⚠ Warning: Only found {len(video_urls)}/{total_scenes} videos, proceeding anyway")
 
             # Step 4: Compile final video
             yield ProgressEvent(
@@ -194,7 +207,11 @@ class VideoCreationOrchestrator:
 
         raise last_error or Exception("Script generation failed")
 
-    async def _generate_tts_with_fallback(self, script: str) -> Dict[str, Any]:
+    async def _generate_tts_with_fallback(
+        self,
+        script: str,
+        voice_id: str = "nPczCjzI2devNBz1zQrb"
+    ) -> Dict[str, Any]:
         """Generate TTS audio with ElevenLabs primary, Google fallback."""
         from tts import generate_elevenlabs_tts_with_timing, generate_tts_with_timing
         from config import ELEVENLABS_AVAILABLE, TTS_AVAILABLE
@@ -202,8 +219,8 @@ class VideoCreationOrchestrator:
         # Try ElevenLabs first
         if ELEVENLABS_AVAILABLE:
             try:
-                print("Attempting ElevenLabs TTS...")
-                audio_content, alignment = generate_elevenlabs_tts_with_timing(script)
+                print(f"Attempting ElevenLabs TTS with voice: {voice_id}...")
+                audio_content, alignment = generate_elevenlabs_tts_with_timing(script, voice_id=voice_id)
                 audio_base64 = base64.b64encode(audio_content).decode('utf-8')
 
                 alignment_dict = None
@@ -217,7 +234,8 @@ class VideoCreationOrchestrator:
                 return {
                     "audio_url": f"data:audio/mp3;base64,{audio_base64}",
                     "alignment": alignment_dict,
-                    "provider": "elevenlabs"
+                    "provider": "elevenlabs",
+                    "voice_id": voice_id
                 }
             except Exception as e:
                 print(f"ElevenLabs TTS failed: {e}, trying Google...")
@@ -245,18 +263,24 @@ class VideoCreationOrchestrator:
         self, scenes: List[VideoScene]
     ) -> List[Dict[str, Any]]:
         """Search for videos for each scene with fallback queries."""
-        from video_search import search_pexels_videos, search_pixabay_videos
-
         results = []
 
-        for scene in scenes:
+        print(f"\n🎬 Searching videos for {len(scenes)} scenes:")
+        for i, scene in enumerate(scenes):
+            section_name = scene.section_name or f"Scene {scene.scene_number}"
+            print(f"\n[{i+1}/{len(scenes)}] {section_name} - query: \"{scene.search_query}\"")
+
             video_result = await self._search_video_with_fallbacks(scene)
             results.append({
                 "scene_number": scene.scene_number,
+                "section_name": section_name,
                 "search_query": scene.search_query,
                 "video_url": video_result.get("url") if video_result else None,
                 "video_source": video_result.get("source") if video_result else None,
             })
+
+        found_count = sum(1 for r in results if r.get("video_url"))
+        print(f"\n✅ Video search complete: {found_count}/{len(scenes)} scenes have videos\n")
 
         return results
 
@@ -266,75 +290,143 @@ class VideoCreationOrchestrator:
         """Search for a video with fallback queries if primary fails."""
         from video_search import search_pexels_videos, search_pixabay_videos
 
-        # Build list of queries to try
+        # Build list of queries to try - from specific to generic
         queries = [
             scene.search_query,
             self._simplify_query(scene.search_query),
             self._get_generic_fallback(scene),
         ]
 
+        # Ultimate fallbacks - these almost always return results on Pexels
+        ultimate_fallbacks = ["people", "nature", "city", "ocean", "sky"]
+
         for query in queries:
             if not query:
                 continue
 
-            print(f"  Searching for scene {scene.scene_number}: '{query}'")
+            result = self._try_search(query, scene.scene_number)
+            if result:
+                return result
 
-            # Try Pexels
-            try:
-                videos = search_pexels_videos(query, per_page=3)
-                if videos:
-                    # Find vertical video
-                    for video in videos:
-                        if self._is_vertical(video):
-                            print(f"    ✓ Found vertical video on Pexels")
-                            return {"url": video["url"], "source": "pexels"}
-                    # Fall back to first video
-                    print(f"    ✓ Found video on Pexels (not vertical)")
-                    return {"url": videos[0]["url"], "source": "pexels"}
-            except Exception as e:
-                print(f"    Pexels search failed: {e}")
+        # If all scene-specific queries failed, try ultimate fallbacks
+        print(f"  Scene {scene.scene_number}: trying ultimate fallbacks...")
+        for fallback in ultimate_fallbacks:
+            result = self._try_search(fallback, scene.scene_number)
+            if result:
+                return result
 
-            # Try Pixabay
-            try:
-                videos = search_pixabay_videos(query, per_page=3)
-                if videos:
-                    for video in videos:
-                        if self._is_vertical(video):
-                            print(f"    ✓ Found vertical video on Pixabay")
-                            return {"url": video["url"], "source": "pixabay"}
-                    print(f"    ✓ Found video on Pixabay (not vertical)")
-                    return {"url": videos[0]["url"], "source": "pixabay"}
-            except Exception as e:
-                print(f"    Pixabay search failed: {e}")
+        print(f"    ✗ No video found for scene {scene.scene_number} (all fallbacks exhausted)")
+        return None
 
-        print(f"    ✗ No video found for scene {scene.scene_number}")
+    def _try_search(self, query: str, scene_number: int) -> Optional[Dict[str, Any]]:
+        """
+        Search both Pexels and Pixabay, pick the best result.
+        Preference: vertical video > more results > Pexels (has portrait filter)
+        """
+        from video_search import search_pexels_videos, search_pixabay_videos
+
+        print(f"  Searching for scene {scene_number}: '{query}'")
+
+        pexels_results = []
+        pixabay_results = []
+
+        # Query both APIs
+        try:
+            pexels_results = search_pexels_videos(query, per_page=5, orientation="portrait")
+        except Exception as e:
+            print(f"    Pexels error: {e}")
+
+        try:
+            pixabay_results = search_pixabay_videos(query, per_page=5)
+        except Exception as e:
+            print(f"    Pixabay error: {e}")
+
+        # Find best vertical video from each source
+        pexels_vertical = next((v for v in pexels_results if self._is_vertical(v)), None)
+        pixabay_vertical = next((v for v in pixabay_results if self._is_vertical(v)), None)
+
+        # Decision logic: prefer vertical videos, then compare result counts
+        if pexels_vertical and pixabay_vertical:
+            # Both have vertical - pick source with more results (more variety)
+            if len(pixabay_results) > len(pexels_results):
+                print(f"    ✓ Pixabay vertical ({len(pixabay_results)} results)")
+                return {"url": pixabay_vertical["url"], "source": "pixabay"}
+            else:
+                print(f"    ✓ Pexels vertical ({len(pexels_results)} results)")
+                return {"url": pexels_vertical["url"], "source": "pexels"}
+
+        elif pexels_vertical:
+            print(f"    ✓ Pexels vertical (only source with vertical)")
+            return {"url": pexels_vertical["url"], "source": "pexels"}
+
+        elif pixabay_vertical:
+            print(f"    ✓ Pixabay vertical (only source with vertical)")
+            return {"url": pixabay_vertical["url"], "source": "pixabay"}
+
+        # No vertical videos - fall back to any video, prefer more results
+        if pexels_results and pixabay_results:
+            if len(pixabay_results) > len(pexels_results):
+                print(f"    ✓ Pixabay (no vertical, {len(pixabay_results)} results)")
+                return {"url": pixabay_results[0]["url"], "source": "pixabay"}
+            else:
+                print(f"    ✓ Pexels (no vertical, {len(pexels_results)} results)")
+                return {"url": pexels_results[0]["url"], "source": "pexels"}
+
+        elif pexels_results:
+            print(f"    ✓ Pexels (only source with results)")
+            return {"url": pexels_results[0]["url"], "source": "pexels"}
+
+        elif pixabay_results:
+            print(f"    ✓ Pixabay (only source with results)")
+            return {"url": pixabay_results[0]["url"], "source": "pixabay"}
+
         return None
 
     def _simplify_query(self, query: str) -> str:
-        """Simplify a search query by keeping only key words."""
+        """Simplify a search query to 1-2 core words for Pexels."""
         if not query:
             return ""
-        words = query.split()
-        # Keep first 2 words
-        return " ".join(words[:2])
+
+        # Common words that don't help with stock video search
+        skip_words = {
+            'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+            'person', 'people', 'man', 'woman',  # too generic alone
+        }
+
+        words = query.lower().split()
+        useful_words = [w for w in words if w not in skip_words and len(w) > 2]
+
+        if useful_words:
+            # Return first useful word (most likely to be the subject)
+            return useful_words[0]
+
+        # Fallback to first word if nothing useful
+        return words[0] if words else "people"
 
     def _get_generic_fallback(self, scene: VideoScene) -> str:
         """Get a generic fallback query based on scene description."""
-        # Map common themes to generic searches
         desc_lower = scene.description.lower() if scene.description else ""
 
-        if any(word in desc_lower for word in ["person", "people", "man", "woman"]):
-            return "person talking"
-        if any(word in desc_lower for word in ["money", "cash", "dollar", "finance"]):
-            return "money cash"
-        if any(word in desc_lower for word in ["city", "street", "urban"]):
-            return "city skyline"
-        if any(word in desc_lower for word in ["nature", "outdoor", "forest"]):
-            return "nature landscape"
-        if any(word in desc_lower for word in ["technology", "computer", "phone"]):
-            return "technology screen"
+        # Map themes to Pexels-friendly single/double word queries
+        theme_map = [
+            (["money", "cash", "dollar", "finance", "wealth", "rich"], "money"),
+            (["city", "street", "urban", "downtown"], "city"),
+            (["nature", "outdoor", "forest", "trees"], "forest"),
+            (["ocean", "sea", "water", "beach"], "ocean"),
+            (["technology", "computer", "laptop", "screen"], "laptop"),
+            (["phone", "mobile", "smartphone"], "phone"),
+            (["office", "work", "business", "corporate"], "office"),
+            (["food", "eating", "restaurant", "cooking"], "food"),
+            (["car", "driving", "road", "traffic"], "car"),
+            (["sky", "clouds", "sunset", "sunrise"], "sky"),
+        ]
 
-        return "abstract background"
+        for keywords, query in theme_map:
+            if any(word in desc_lower for word in keywords):
+                return query
+
+        # Default fallback - generic but works well on Pexels
+        return "people"
 
     def _is_vertical(self, video: Dict[str, Any]) -> bool:
         """Check if a video is vertical (9:16 aspect ratio)."""

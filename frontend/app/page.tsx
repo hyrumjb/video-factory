@@ -16,12 +16,17 @@ import {
 export default function Home() {
   const [topic, setTopic] = useState('');
   const [placeholder, setPlaceholder] = useState('');
-  const [selectedVoice, setSelectedVoice] = useState('en-AU-Neural2-A');
+  const [selectedVoice, setSelectedVoice] = useState('nPczCjzI2devNBz1zQrb');
   const router = useRouter();
 
+  // Popular ElevenLabs voices for eleven_turbo_v2_5 model
   const voices = [
-    { name: 'en-AU-Neural2-A', label: 'Female' },
-    { name: 'en-AU-Neural2-B', label: 'Male' },
+    { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian', description: 'Male, American, narration' },
+    { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel', description: 'Female, American, calm' },
+    { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam', description: 'Male, American, deep' },
+    { id: 'ThT5KcBeYPX3keUQqHPh', name: 'Dorothy', description: 'Female, British, soft' },
+    { id: 'N2lVS1w4EtoT3dr4eOWO', name: 'Callum', description: 'Male, British, hoarse' },
+    { id: 'XB0fDUnXU5powFXDhCwa', name: 'Charlotte', description: 'Female, Swedish, seductive' },
   ];
 
   const placeholders = [
@@ -125,13 +130,18 @@ export default function Home() {
 
             <div className="flex items-center gap-3 justify-end">
               <Select value={selectedVoice} onValueChange={setSelectedVoice}>
-                <SelectTrigger className="w-32">
-                  <SelectValue />
+                <SelectTrigger className="w-40">
+                  <SelectValue>
+                    {voices.find(v => v.id === selectedVoice)?.name || 'Select voice'}
+                  </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {voices.map((voice) => (
-                    <SelectItem key={voice.name} value={voice.name}>
-                      {voice.label}
+                    <SelectItem key={voice.id} value={voice.id}>
+                      <div className="flex flex-col">
+                        <span className="font-medium">{voice.name}</span>
+                        <span className="text-xs text-muted-foreground">{voice.description}</span>
+                      </div>
                     </SelectItem>
                   ))}
                 </SelectContent>

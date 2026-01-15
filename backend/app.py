@@ -243,13 +243,17 @@ async def generate_script(request: ScriptRequest):
 
 
 @app.get("/api/create-video")
-async def create_video_stream(topic: str):
+async def create_video_stream(topic: str, voice_id: str = "nPczCjzI2devNBz1zQrb"):
     """
     SSE endpoint that orchestrates the entire video creation pipeline.
     Streams progress events and returns the final video URL.
 
+    Args:
+        topic: The video topic/prompt
+        voice_id: ElevenLabs voice ID (default: Brian)
+
     Usage:
-        const eventSource = new EventSource('/api/create-video?topic=...');
+        const eventSource = new EventSource('/api/create-video?topic=...&voice_id=...');
         eventSource.onmessage = (event) => {
             const data = JSON.parse(event.data);
             // data.step: 'script' | 'tts' | 'videos' | 'compile' | 'complete' | 'error'
@@ -260,7 +264,7 @@ async def create_video_stream(topic: str):
     """
     async def event_generator():
         orchestrator = VideoCreationOrchestrator()
-        async for progress_event in orchestrator.create_video(topic):
+        async for progress_event in orchestrator.create_video(topic, voice_id=voice_id):
             yield {
                 "event": "message",
                 "data": progress_event.to_json()
