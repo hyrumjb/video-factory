@@ -10,12 +10,6 @@ from fastapi import HTTPException
 from models import VideoSearchRequest, VideoSearchResponse, VideoItem
 
 
-# Pexels API documentation:
-# - query: "Ocean, Tigers, Pears" or "Group of people working"
-# - orientation: landscape, portrait, or square
-# - size: large (4K), medium (Full HD), small (HD)
-
-
 def search_pexels_videos(
     query: str,
     per_page: int = 5,
@@ -44,7 +38,7 @@ def search_pexels_videos(
             params={
                 "query": query,
                 "per_page": per_page,
-                "orientation": orientation,  # portrait, landscape, or square
+                "orientation": orientation,
                 "size": "medium",  # Full HD quality
             },
             timeout=10
@@ -64,7 +58,6 @@ def search_pexels_videos(
                 continue
 
             # Find best quality video file (prefer HD/Full HD)
-            # Sort by height descending, but cap at 1920 to avoid huge files
             suitable_files = [
                 vf for vf in video_files
                 if vf.get("height", 0) <= 1920 and vf.get("link")
@@ -103,8 +96,6 @@ def search_pixabay_videos(
     """
     Search Pixabay for videos matching the query.
 
-    API: https://pixabay.com/api/videos/?key=API_KEY&q=yellow+flowers
-
     Args:
         query: Simple search terms (will be URL encoded automatically)
         per_page: Number of results (3-200)
@@ -118,12 +109,11 @@ def search_pixabay_videos(
         return []
 
     try:
-        # requests library will URL-encode the 'q' parameter automatically
         response = requests.get(
             "https://pixabay.com/api/videos/",
             params={
                 "key": api_key,
-                "q": query,  # Don't pre-encode, requests handles it
+                "q": query,
                 "per_page": per_page,
                 "safesearch": "true",
                 "order": "popular",

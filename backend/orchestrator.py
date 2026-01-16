@@ -61,7 +61,9 @@ class VideoCreationOrchestrator:
     async def create_video(
         self,
         topic: str,
-        voice_id: str = "nPczCjzI2devNBz1zQrb"
+        voice_id: str = "nPczCjzI2devNBz1zQrb",
+        staged: bool = False,
+        background_type: str = "videos"  # "videos", "images", or "ai"
     ) -> AsyncGenerator[ProgressEvent, None]:
         """
         Main orchestration method. Yields progress events as SSE data.
@@ -69,11 +71,16 @@ class VideoCreationOrchestrator:
         Args:
             topic: The video topic/prompt
             voice_id: ElevenLabs voice ID (default: Brian)
+            staged: If True, stop after script + media search (no TTS/compile)
+            background_type: Type of background media ("videos", "images", or "ai")
         """
         script_response: Optional[ScriptResponse] = None
         audio_data: Optional[Dict[str, Any]] = None
         video_urls: List[str] = []
         scenes_with_videos: List[Dict[str, Any]] = []
+        ai_images_result: Optional[Dict[str, Any]] = None
+
+        print(f"\n🎬 Starting video creation - background_type: {background_type}")
 
         try:
             # Step 1: Generate Script
@@ -85,6 +92,11 @@ class VideoCreationOrchestrator:
 
             script_response = await self._generate_script_with_retry(topic)
 
+            # Include sections in script data for displaying raw vs edited
+            sections_data = None
+            if script_response.sections:
+                sections_data = [s.dict() if hasattr(s, 'dict') else s.model_dump() for s in script_response.sections]
+
             yield ProgressEvent(
                 step="script",
                 status=StepStatus.DONE,
@@ -92,31 +104,147 @@ class VideoCreationOrchestrator:
                 data={
                     "script": script_response.script,
                     "scenes": [s.dict() if hasattr(s, 'dict') else s.model_dump() for s in script_response.scenes],
+                    "sections": sections_data,
                 }
             )
 
-            # Step 2 & 3: TTS and Video Search in parallel
+            # Step 2: Search for videos/images based on background_type
+            # Only search for what the user selected, not everything
+            search_videos = background_type == "videos"
+            search_images = background_type == "images"
+
+            if background_type == "ai":
+                search_message = "Generating AI images..."
+            elif background_type == "images":
+                search_message = "Searching for Google images..."
+            else:  # videos
+                search_message = "Searching for stock videos..."
+
+            yield ProgressEvent(
+                step="videos",
+                status=StepStatus.RUNNING,
+                message=search_message
+            )
+
+            # Search based on selected type (AI mode doesn't need stock video/image search initially)
+            if background_type != "ai":
+                scenes_with_videos = await self._search_videos_for_scenes(
+                    script_response.scenes,
+                    topic=topic,
+                    script=script_response.script,
+                    search_videos=search_videos,
+                    search_images=search_images
+                )
+            else:
+                # For AI mode, create empty scene placeholders (no video/image search)
+                scenes_with_videos = [
+                    {
+                        "scene_number": scene.scene_number,
+                        "section_name": scene.section_name or f"Scene {scene.scene_number}",
+                        "video_search_query": scene.search_query,
+                        "video_url": None,
+                        "video_source": None,
+                        "image_search_query": scene.search_query,
+                        "images": [],
+                    }
+                    for scene in script_response.scenes
+                ]
+
+            # If AI mode, also generate AI images
+            print(f"   Checking AI mode: background_type='{background_type}' (is 'ai': {background_type == 'ai'})")
+            if background_type == "ai":
+                print("   🎨 AI mode detected - starting AI image generation...")
+                try:
+                    from image_generate import generate_image_for_video, FAL_AVAILABLE
+                    print(f"   FAL_AVAILABLE: {FAL_AVAILABLE}")
+
+                    # Build sections list for AI generation (one image per section)
+                    sections_for_ai = []
+                    if script_response.sections and len(script_response.sections) > 0:
+                        sections_for_ai = [
+                            {"name": s.name, "text": s.text}
+                            for s in script_response.sections
+                        ]
+                    else:
+                        # Fallback: use first 100 words of script as single section
+                        words = script_response.script.split()
+                        first_section_text = " ".join(words[:min(100, len(words))])
+                        sections_for_ai = [{"name": "HOOK", "text": first_section_text}]
+
+                    ai_images_result = await generate_image_for_video(
+                        topic=topic,
+                        script=script_response.script,
+                        first_section_text=sections_for_ai[0]["text"] if sections_for_ai else "",
+                        sections=sections_for_ai
+                    )
+                    total_images = len(ai_images_result.get('images', []))
+                    print(f"✓ AI image generation complete: {total_images} images")
+                except Exception as e:
+                    print(f"⚠ AI image generation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    ai_images_result = {"images": [], "prompts": [], "error": str(e)}
+
+            # Report search completion based on what was searched
+            video_urls = [s["video_url"] for s in scenes_with_videos if s.get("video_url")]
+            images_found = sum(1 for s in scenes_with_videos if s.get("images"))
+            total_scenes = len(script_response.scenes)
+
+            # Build completion message based on what was actually searched
+            completion_parts = []
+            if background_type == "videos":
+                completion_parts.append(f"Found {len(video_urls)}/{total_scenes} videos")
+            elif background_type == "images":
+                completion_parts.append(f"Found {images_found}/{total_scenes} image sets")
+            elif background_type == "ai" and ai_images_result:
+                ai_success = sum(1 for img in ai_images_result.get("images", []) if img.get("url"))
+                total_expected = len(ai_images_result.get("images", []))
+                completion_parts.append(f"Generated {ai_success}/{total_expected} AI images")
+
+            completion_msg = ", ".join(completion_parts) if completion_parts else "Media search complete"
+
+            # Build video step data
+            videos_data: Dict[str, Any] = {"videos": scenes_with_videos}
+            if ai_images_result:
+                videos_data["ai_images"] = ai_images_result.get("images", [])
+                videos_data["ai_prompts"] = ai_images_result.get("prompts", [])
+
+            yield ProgressEvent(
+                step="videos",
+                status=StepStatus.DONE,
+                message=completion_msg,
+                data=videos_data
+            )
+
+            # If staged mode, stop here and emit paused event
+            if staged:
+                paused_data: Dict[str, Any] = {
+                    "script": script_response.script,
+                    "scenes": [s.dict() if hasattr(s, 'dict') else s.model_dump() for s in script_response.scenes],
+                    "sections": sections_data,
+                    "videos": scenes_with_videos,
+                    "voice_id": voice_id,
+                }
+                if ai_images_result:
+                    paused_data["ai_images"] = ai_images_result.get("images", [])
+                    paused_data["ai_prompt"] = ai_images_result.get("prompt")
+
+                yield ProgressEvent(
+                    step="paused",
+                    status=StepStatus.DONE,
+                    message="Ready for TTS and video compilation",
+                    data=paused_data
+                )
+                return  # Stop here in staged mode
+
+            # Step 3: TTS (only in non-staged mode)
             yield ProgressEvent(
                 step="tts",
                 status=StepStatus.RUNNING,
                 message="Generating audio..."
             )
-            yield ProgressEvent(
-                step="videos",
-                status=StepStatus.RUNNING,
-                message="Searching for stock videos..."
-            )
 
-            # Run TTS and video search concurrently
-            tts_task = asyncio.create_task(
-                self._generate_tts_with_fallback(script_response.script, voice_id)
-            )
-            videos_task = asyncio.create_task(
-                self._search_videos_for_scenes(script_response.scenes)
-            )
-
-            # Wait for both
-            audio_data, scenes_with_videos = await asyncio.gather(tts_task, videos_task)
+            audio_data = await self._generate_tts_with_fallback(script_response.script, voice_id)
 
             # Report TTS completion
             yield ProgressEvent(
@@ -124,17 +252,6 @@ class VideoCreationOrchestrator:
                 status=StepStatus.DONE,
                 message=f"Audio generated ({audio_data.get('provider', 'unknown')})",
                 data={"provider": audio_data.get("provider")}
-            )
-
-            # Report video search completion
-            video_urls = [s["video_url"] for s in scenes_with_videos if s.get("video_url")]
-            total_scenes = len(script_response.scenes)
-
-            yield ProgressEvent(
-                step="videos",
-                status=StepStatus.DONE,
-                message=f"Found {len(video_urls)}/{total_scenes} videos",
-                data={"videos": scenes_with_videos}
             )
 
             if not video_urls:
@@ -260,34 +377,113 @@ class VideoCreationOrchestrator:
         raise Exception("No TTS provider available")
 
     async def _search_videos_for_scenes(
-        self, scenes: List[VideoScene]
+        self, scenes: List[VideoScene], topic: str = "", script: str = "",
+        search_videos: bool = True, search_images: bool = True
     ) -> List[Dict[str, Any]]:
-        """Search for videos for each scene with fallback queries."""
+        """Search for videos and/or images for each scene with fallback queries.
+
+        Args:
+            scenes: List of video scenes
+            topic: Video topic for context
+            script: Full script for context
+            search_videos: If True, search for stock videos
+            search_images: If True, search for Google images
+        """
+        from image_search import generate_image_search_queries, search_images_with_query
+
         results = []
 
-        print(f"\n🎬 Searching videos for {len(scenes)} scenes:")
+        # Generate image search queries if needed
+        image_queries = []
+        if search_images:
+            print(f"\n🔍 Generating image search queries for {len(scenes)} scenes...")
+            scenes_for_llm = [
+                {
+                    "scene_number": s.scene_number,
+                    "section_name": s.section_name or f"Scene {s.scene_number}",
+                    "description": s.description
+                }
+                for s in scenes
+            ]
+            image_queries = generate_image_search_queries(topic, script, scenes_for_llm)
+
+        search_type = "videos" if search_videos and not search_images else "images" if search_images and not search_videos else "videos and images"
+        print(f"\n🎬 Searching {search_type} for {len(scenes)} scenes:")
+
         for i, scene in enumerate(scenes):
             section_name = scene.section_name or f"Scene {scene.scene_number}"
-            print(f"\n[{i+1}/{len(scenes)}] {section_name} - query: \"{scene.search_query}\"")
+            image_query = image_queries[i] if i < len(image_queries) else scene.search_query
 
-            video_result = await self._search_video_with_fallbacks(scene)
+            print(f"\n[{i+1}/{len(scenes)}] {section_name}")
+            if search_videos:
+                print(f"  Video query: \"{scene.search_query}\"")
+            if search_images:
+                print(f"  Image query: \"{image_query}\"")
+
+            # Build tasks based on what we need to search
+            tasks = []
+            task_types = []
+
+            if search_videos:
+                tasks.append(asyncio.create_task(
+                    self._search_video_with_fallbacks_async(scene)
+                ))
+                task_types.append("video")
+
+            if search_images:
+                tasks.append(asyncio.create_task(
+                    search_images_with_query(
+                        search_query=image_query,
+                        fallback_query=scene.search_query
+                    )
+                ))
+                task_types.append("image")
+
+            # Run searches in parallel
+            task_results = await asyncio.gather(*tasks)
+
+            # Parse results based on task types
+            video_result = None
+            image_result = {"query": image_query, "images": []}
+
+            for j, task_type in enumerate(task_types):
+                if task_type == "video":
+                    video_result = task_results[j]
+                elif task_type == "image":
+                    image_result = task_results[j]
+
             results.append({
                 "scene_number": scene.scene_number,
                 "section_name": section_name,
-                "search_query": scene.search_query,
+                "video_search_query": scene.search_query,
                 "video_url": video_result.get("url") if video_result else None,
                 "video_source": video_result.get("source") if video_result else None,
+                "image_search_query": image_result.get("query", image_query),
+                "images": image_result.get("images", []),
             })
 
-        found_count = sum(1 for r in results if r.get("video_url"))
-        print(f"\n✅ Video search complete: {found_count}/{len(scenes)} scenes have videos\n")
+        found_videos = sum(1 for r in results if r.get("video_url"))
+        found_images = sum(1 for r in results if r.get("images"))
+
+        completion_parts = []
+        if search_videos:
+            completion_parts.append(f"{found_videos}/{len(scenes)} videos")
+        if search_images:
+            completion_parts.append(f"{found_images}/{len(scenes)} image sets")
+        print(f"\n✅ Search complete: {', '.join(completion_parts)}\n")
 
         return results
 
-    async def _search_video_with_fallbacks(
+    async def _search_video_with_fallbacks_async(
         self, scene: VideoScene
     ) -> Optional[Dict[str, Any]]:
-        """Search for a video with fallback queries if primary fails."""
+        """Async wrapper for _search_video_with_fallbacks."""
+        return await asyncio.to_thread(self._search_video_with_fallbacks_sync, scene)
+
+    def _search_video_with_fallbacks_sync(
+        self, scene: VideoScene
+    ) -> Optional[Dict[str, Any]]:
+        """Search for a video with fallback queries if primary fails (synchronous)."""
         from video_search import search_pexels_videos, search_pixabay_videos
 
         # Build list of queries to try - from specific to generic
@@ -436,6 +632,124 @@ class VideoCreationOrchestrator:
             return height > width
         return False
 
+    def _calculate_scene_durations(
+        self,
+        alignment: Optional[Dict[str, Any]],
+        scenes: List[Dict[str, Any]],
+        audio_duration: float,
+        num_videos: int
+    ) -> List[float]:
+        """
+        Calculate scene durations from ElevenLabs alignment data and scene word boundaries.
+
+        Args:
+            alignment: ElevenLabs alignment dict with character-level timing
+            scenes: List of scene dicts with word_start and word_end
+            audio_duration: Total audio duration in seconds
+            num_videos: Number of videos (for fallback)
+
+        Returns:
+            List of durations in seconds for each scene
+        """
+        if not alignment or not scenes:
+            print("⚠ No alignment data or scenes, using equal duration fallback")
+            equal_duration = audio_duration / num_videos
+            return [equal_duration] * num_videos
+
+        try:
+            characters = alignment.get('characters', [])
+            start_times = alignment.get('character_start_times_seconds', [])
+            end_times = alignment.get('character_end_times_seconds', [])
+
+            if not characters or not start_times or not end_times:
+                print("⚠ Alignment data incomplete, using equal duration fallback")
+                equal_duration = audio_duration / num_videos
+                return [equal_duration] * num_videos
+
+            # Build word boundaries from character data
+            word_boundaries = []
+            current_word_index = 0
+            word_start_time = None
+            word_end_time = None
+
+            for i, char in enumerate(characters):
+                if i >= len(start_times) or i >= len(end_times):
+                    break
+
+                if char == ' ' or char == '\n':
+                    # End of word
+                    if word_start_time is not None:
+                        word_boundaries.append({
+                            'word_index': current_word_index,
+                            'start': word_start_time,
+                            'end': word_end_time
+                        })
+                        current_word_index += 1
+                    word_start_time = None
+                    word_end_time = None
+                else:
+                    # Part of a word
+                    if word_start_time is None:
+                        word_start_time = start_times[i]
+                    word_end_time = end_times[i]
+
+            # Don't forget the last word
+            if word_start_time is not None:
+                word_boundaries.append({
+                    'word_index': current_word_index,
+                    'start': word_start_time,
+                    'end': word_end_time
+                })
+
+            print(f"✓ Built {len(word_boundaries)} word boundaries from alignment")
+
+            # Create a map of word_index -> timing
+            word_timing_map = {wb['word_index']: wb for wb in word_boundaries}
+
+            # Calculate duration for each scene based on word boundaries
+            scene_durations = []
+
+            for scene in sorted(scenes, key=lambda s: s.get('scene_number', 0)):
+                word_start = scene.get('word_start', 0)
+                word_end = scene.get('word_end', len(word_boundaries))
+
+                if word_start is None or word_end is None:
+                    # Scene missing word boundaries, use equal portion
+                    scene_durations.append(audio_duration / num_videos)
+                    continue
+
+                # Get start time (from word_start)
+                if word_start in word_timing_map:
+                    start_time = word_timing_map[word_start]['start']
+                elif word_start == 0:
+                    start_time = 0.0
+                else:
+                    # Estimate: use previous word's end time
+                    prev_words = [w for w in word_boundaries if w['word_index'] < word_start]
+                    start_time = prev_words[-1]['end'] if prev_words else 0.0
+
+                # Get end time (from word_end - 1, since word_end is exclusive)
+                end_word_index = word_end - 1
+                if end_word_index in word_timing_map:
+                    end_time = word_timing_map[end_word_index]['end']
+                else:
+                    # Estimate: use last known word's end time or audio duration
+                    end_time = audio_duration
+
+                duration = max(end_time - start_time, 0.5)  # Minimum 0.5 second per scene
+                scene_durations.append(duration)
+
+                print(f"   Scene {scene.get('scene_number')}: words {word_start}-{word_end} = {start_time:.2f}s - {end_time:.2f}s ({duration:.2f}s)")
+
+            return scene_durations
+
+        except Exception as e:
+            print(f"⚠ Error calculating scene durations: {e}")
+            import traceback
+            traceback.print_exc()
+            equal_duration = audio_duration / num_videos
+            return [equal_duration] * num_videos
+
     async def _compile_video(
         self,
         video_urls: List[str],
@@ -445,127 +759,43 @@ class VideoCreationOrchestrator:
         tts_provider: str,
         scenes: List[Dict[str, Any]]
     ) -> str:
-        """Compile the final video by calling the compile endpoint logic."""
-        # Import the compile logic
-        import tempfile
-        import subprocess
-        import requests
-        from pathlib import Path
-        from config import FFMPEG_EXECUTABLE, FFPROBE_EXECUTABLE
+        """
+        Compile the final video using the video_compilation module.
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        Delegates to video_compilation.compile_video() which handles:
+        - Downloading and trimming videos
+        - Generating subtitles (ElevenLabs alignment or fallback)
+        - Burning captions with karaoke effects
+        - Adding audio and encoding final video
+        """
+        from video_compilation import compile_video
+        from models import CompileVideoRequest, SceneTimingInfo
 
-            # Download audio
-            if audio_url.startswith('data:audio'):
-                audio_base64 = audio_url.split(',')[1]
-                audio_data = base64.b64decode(audio_base64)
-                if 'audio/mp3' in audio_url or 'audio/mpeg' in audio_url:
-                    audio_path = temp_path / "audio.mp3"
-                else:
-                    audio_path = temp_path / "audio.wav"
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_data)
-            else:
-                raise Exception("Audio URL must be base64 data URL")
+        # Build scene timing info for duration calculation
+        scene_timing = [
+            SceneTimingInfo(
+                scene_number=s.get('scene_number', i + 1),
+                word_start=s.get('word_start'),
+                word_end=s.get('word_end')
+            )
+            for i, s in enumerate(scenes)
+        ] if scenes else None
 
-            # Get audio duration
-            probe_cmd = [
-                FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-            audio_duration = float(result.stdout.strip())
-            print(f"Audio duration: {audio_duration:.2f}s")
+        # Let video_compilation calculate scene durations from alignment
+        # This ensures consistent timing calculation with better debugging
+        scene_durations = None  # video_compilation will calculate from alignment + scenes
 
-            # Download videos
-            video_paths = []
-            for i, url in enumerate(video_urls):
-                try:
-                    response = requests.get(url, timeout=30, stream=True)
-                    if response.status_code == 200:
-                        video_path = temp_path / f"video_{i+1}.mp4"
-                        with open(video_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                        video_paths.append(str(video_path))
-                except Exception as e:
-                    print(f"Failed to download video {i+1}: {e}")
+        # Create request for video_compilation module
+        request = CompileVideoRequest(
+            video_urls=video_urls,
+            audio_url=audio_url,
+            script=script,
+            alignment=alignment,
+            tts_provider=tts_provider,
+            scenes=scene_timing,
+            scene_durations=scene_durations
+        )
 
-            if not video_paths:
-                raise Exception("Failed to download any videos")
-
-            # Calculate scene durations (equal split for now)
-            scene_duration = audio_duration / len(video_paths)
-
-            # Trim videos
-            trimmed_videos = []
-            for i, video_path in enumerate(video_paths):
-                trimmed_path = temp_path / f"trimmed_{i+1}.mp4"
-                trim_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', video_path,
-                    '-t', f'{scene_duration:.3f}',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-an',
-                    str(trimmed_path)
-                ]
-                subprocess.run(trim_cmd, capture_output=True, timeout=30)
-                trimmed_videos.append(trimmed_path)
-
-            # Concatenate videos
-            concat_path = temp_path / "concat.mp4"
-            if len(trimmed_videos) == 1:
-                # Single video - just scale
-                scale_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(trimmed_videos[0]),
-                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-an',
-                    str(concat_path)
-                ]
-                subprocess.run(scale_cmd, capture_output=True, timeout=60)
-            else:
-                # Multiple videos - concatenate with filter_complex
-                filter_parts = []
-                for i in range(len(trimmed_videos)):
-                    filter_parts.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}];")
-                filter_parts.append("".join([f"[v{i}]" for i in range(len(trimmed_videos))]))
-                filter_parts.append(f"concat=n={len(trimmed_videos)}:v=1:a=0[outv]")
-                filter_complex = "".join(filter_parts)
-
-                concat_cmd = [FFMPEG_EXECUTABLE, '-y']
-                for vp in trimmed_videos:
-                    concat_cmd.extend(['-i', str(vp)])
-                concat_cmd.extend([
-                    '-filter_complex', filter_complex,
-                    '-map', '[outv]',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    str(concat_path)
-                ])
-                subprocess.run(concat_cmd, capture_output=True, timeout=120)
-
-            # Add audio
-            output_path = temp_path / "final.mp4"
-            audio_cmd = [
-                FFMPEG_EXECUTABLE, '-y',
-                '-i', str(concat_path),
-                '-i', str(audio_path),
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-shortest',
-                str(output_path)
-            ]
-            subprocess.run(audio_cmd, capture_output=True, timeout=60)
-
-            # Read and return as base64
-            with open(output_path, 'rb') as f:
-                video_content = f.read()
-
-            video_base64 = base64.b64encode(video_content).decode('utf-8')
-            return f"data:video/mp4;base64,{video_base64}"
+        # Delegate to video_compilation module
+        response = await compile_video(request)
+        return response.video_url

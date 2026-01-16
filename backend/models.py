@@ -46,7 +46,7 @@ class SceneTimingInfo(BaseModel):
 
 
 class CompileVideoRequest(BaseModel):
-    video_urls: List[str]  # List of video URLs to combine
+    video_urls: List[str]  # List of video/image URLs to combine
     audio_url: str  # Base64 audio data URL
     script: str  # Script text for captions
     scene_durations: Optional[List[float]] = None  # Duration for each scene in seconds
@@ -54,6 +54,7 @@ class CompileVideoRequest(BaseModel):
     alignment: Optional[dict] = None  # ElevenLabs word-level timing data for captions
     tts_provider: Optional[str] = "google"  # "google" or "elevenlabs"
     scenes: Optional[List[SceneTimingInfo]] = None  # Scene word boundaries for timing
+    use_images: Optional[bool] = False  # If True, video_urls contains images to convert to video
 
 
 class CompileVideoResponse(BaseModel):
@@ -97,3 +98,59 @@ class VoiceAudio(BaseModel):
 
 class MultiVoiceTTSResponse(BaseModel):
     voices: List[VoiceAudio]
+
+
+# On-demand media generation models
+class SceneInfo(BaseModel):
+    scene_number: int
+    section_name: Optional[str] = None
+    description: str
+    search_query: str
+
+
+class MediaSearchRequest(BaseModel):
+    topic: str
+    script: str
+    scenes: List[SceneInfo]
+
+
+class SceneMediaResult(BaseModel):
+    scene_number: int
+    section_name: Optional[str] = None
+    video_search_query: str
+    video_url: Optional[str] = None
+    video_source: Optional[str] = None
+    image_search_query: str
+    images: List[dict] = []
+
+
+class MediaSearchResponse(BaseModel):
+    results: List[SceneMediaResult]
+
+
+class SectionInfo(BaseModel):
+    name: str
+    text: str
+
+
+class AIImageRequest(BaseModel):
+    topic: str
+    script: str
+    first_section_text: str  # Backward compatible
+    sections: Optional[List[SectionInfo]] = None  # New: sections for multi-scene generation
+
+
+class AIImageResult(BaseModel):
+    model_name: str
+    model_id: str
+    url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    error: Optional[str] = None
+    scene_number: Optional[int] = None
+    section_name: Optional[str] = None
+
+
+class AIImageResponse(BaseModel):
+    images: List[AIImageResult]  # One image per scene
+    prompts: Optional[List[dict]] = None  # Prompts for each scene

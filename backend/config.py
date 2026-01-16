@@ -18,7 +18,11 @@ try:
     import imageio_ffmpeg
     FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
     ffmpeg_dir = os.path.dirname(FFMPEG_EXECUTABLE)
-    FFPROBE_EXECUTABLE = os.path.join(ffmpeg_dir, 'ffprobe' + ('.exe' if os.name == 'nt' else ''))
+    ffprobe_path = os.path.join(ffmpeg_dir, 'ffprobe' + ('.exe' if os.name == 'nt' else ''))
+    # Only use imageio_ffmpeg's ffprobe if it actually exists
+    if os.path.exists(ffprobe_path):
+        FFPROBE_EXECUTABLE = ffprobe_path
+    # Otherwise keep default 'ffprobe' which will use system PATH
 except ImportError:
     # Fallback to system ffmpeg if imageio-ffmpeg not available
     pass
@@ -79,6 +83,19 @@ except ImportError:
 ELEVENLABS_API_KEY: Optional[str] = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_AVAILABLE: bool = False
 elevenlabs_client: Optional[Any] = None
+
+# Google Programmable Search API configuration
+GOOGLE_SEARCH_API_KEY: Optional[str] = os.getenv("GOOGLE_SEARCH_API_KEY")
+GOOGLE_SEARCH_CX: Optional[str] = os.getenv("GOOGLE_SEARCH_CX")  # Custom Search Engine ID
+GOOGLE_SEARCH_AVAILABLE: bool = bool(GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX)
+
+if GOOGLE_SEARCH_AVAILABLE:
+    print("✓ Google Programmable Search API initialized")
+else:
+    if not GOOGLE_SEARCH_API_KEY:
+        print("⚠ GOOGLE_SEARCH_API_KEY not set - Google image search disabled")
+    if not GOOGLE_SEARCH_CX:
+        print("⚠ GOOGLE_SEARCH_CX not set - Google image search disabled")
 
 if ELEVENLABS_API_KEY:
     try:

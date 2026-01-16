@@ -40,6 +40,12 @@ from models import (
     TTSResponse,
     VoiceAudio,
     MultiVoiceTTSResponse,
+    MediaSearchRequest,
+    MediaSearchResponse,
+    SceneMediaResult,
+    AIImageRequest,
+    AIImageResponse,
+    AIImageResult,
 )
 
 # Import ASS subtitle functions from subtitles module
@@ -243,7 +249,12 @@ async def generate_script(request: ScriptRequest):
 
 
 @app.get("/api/create-video")
-async def create_video_stream(topic: str, voice_id: str = "nPczCjzI2devNBz1zQrb"):
+async def create_video_stream(
+    topic: str,
+    voice_id: str = "nPczCjzI2devNBz1zQrb",
+    staged: bool = False,
+    background_type: str = "videos"
+):
     """
     SSE endpoint that orchestrates the entire video creation pipeline.
     Streams progress events and returns the final video URL.
@@ -251,20 +262,28 @@ async def create_video_stream(topic: str, voice_id: str = "nPczCjzI2devNBz1zQrb"
     Args:
         topic: The video topic/prompt
         voice_id: ElevenLabs voice ID (default: Brian)
+        staged: If true, stop after script + media search (no TTS/compile).
+                Emits 'paused' event with all data for manual continuation.
+        background_type: Type of background media ("videos", "images", or "ai")
 
     Usage:
-        const eventSource = new EventSource('/api/create-video?topic=...&voice_id=...');
+        const eventSource = new EventSource('/api/create-video?topic=...&voice_id=...&staged=true&background_type=ai');
         eventSource.onmessage = (event) => {
             const data = JSON.parse(event.data);
-            // data.step: 'script' | 'tts' | 'videos' | 'compile' | 'complete' | 'error'
+            // data.step: 'script' | 'videos' | 'tts' | 'compile' | 'complete' | 'paused' | 'error'
             // data.status: 'pending' | 'running' | 'done' | 'error' | 'retrying'
             // data.message: Human-readable status message
-            // data.data: Step-specific data (script, video_url, etc.)
+            // data.data: Step-specific data (script, video_url, ai_images, etc.)
         };
     """
     async def event_generator():
         orchestrator = VideoCreationOrchestrator()
-        async for progress_event in orchestrator.create_video(topic, voice_id=voice_id):
+        async for progress_event in orchestrator.create_video(
+            topic,
+            voice_id=voice_id,
+            staged=staged,
+            background_type=background_type
+        ):
             yield {
                 "event": "message",
                 "data": progress_event.to_json()
@@ -1218,488 +1237,179 @@ def create_srt_fallback(script: str, audio_duration: float) -> str:
     return '\n'.join(srt_lines)
 
 @app.post("/api/compile-video", response_model=CompileVideoResponse)
-async def compile_video(request: CompileVideoRequest):
+async def compile_video_endpoint(request: CompileVideoRequest):
     """
     Combine multiple stock videos with audio using ffmpeg.
-    Downloads videos, combines them, adds audio, burns captions, and returns the final video.
+    Delegates to video_compilation module for actual processing.
+    """
+    from video_compilation import compile_video as compile_video_impl
+    return await compile_video_impl(request)
+
+
+# Video compilation logic moved to video_compilation.py module
+
+
+@app.post("/api/search-stock-videos", response_model=MediaSearchResponse)
+async def search_stock_videos(request: MediaSearchRequest):
+    """
+    Search for stock videos for the given scenes.
+    Used for on-demand video search when user selects Videos mode after initial generation.
+    """
+    from video_search import search_pexels_videos, search_pixabay_videos
+
+    results = []
+
+    for scene in request.scenes:
+        search_query = scene.search_query
+
+        # Search both Pexels and Pixabay
+        video_url = None
+        video_source = None
+
+        try:
+            # Try Pexels first (has portrait filter)
+            pexels_results = search_pexels_videos(search_query, per_page=5, orientation="portrait")
+            if pexels_results:
+                # Prefer vertical videos
+                vertical = next((v for v in pexels_results if v.get("height", 0) > v.get("width", 0)), None)
+                if vertical:
+                    video_url = vertical["url"]
+                    video_source = "pexels"
+                else:
+                    video_url = pexels_results[0]["url"]
+                    video_source = "pexels"
+        except Exception as e:
+            print(f"Pexels search error: {e}")
+
+        if not video_url:
+            try:
+                # Try Pixabay as fallback
+                pixabay_results = search_pixabay_videos(search_query, per_page=5)
+                if pixabay_results:
+                    vertical = next((v for v in pixabay_results if v.get("height", 0) > v.get("width", 0)), None)
+                    if vertical:
+                        video_url = vertical["url"]
+                        video_source = "pixabay"
+                    else:
+                        video_url = pixabay_results[0]["url"]
+                        video_source = "pixabay"
+            except Exception as e:
+                print(f"Pixabay search error: {e}")
+
+        results.append(SceneMediaResult(
+            scene_number=scene.scene_number,
+            section_name=scene.section_name,
+            video_search_query=search_query,
+            video_url=video_url,
+            video_source=video_source,
+            image_search_query=search_query,
+            images=[]
+        ))
+
+    return MediaSearchResponse(results=results)
+
+
+@app.post("/api/search-stock-images", response_model=MediaSearchResponse)
+async def search_stock_images(request: MediaSearchRequest):
+    """
+    Search for Google images for the given scenes.
+    Used for on-demand image search when user selects Images mode after initial generation.
+    """
+    from image_search import generate_image_search_queries, search_images_with_query
+    import asyncio
+
+    # Generate optimized search queries using LLM
+    scenes_for_llm = [
+        {
+            "scene_number": s.scene_number,
+            "section_name": s.section_name or f"Scene {s.scene_number}",
+            "description": s.description
+        }
+        for s in request.scenes
+    ]
+    image_queries = generate_image_search_queries(request.topic, request.script, scenes_for_llm)
+
+    results = []
+
+    for i, scene in enumerate(request.scenes):
+        image_query = image_queries[i] if i < len(image_queries) else scene.search_query
+
+        # Search for images
+        image_result = await search_images_with_query(
+            search_query=image_query,
+            fallback_query=scene.search_query
+        )
+
+        results.append(SceneMediaResult(
+            scene_number=scene.scene_number,
+            section_name=scene.section_name,
+            video_search_query=scene.search_query,
+            video_url=None,
+            video_source=None,
+            image_search_query=image_result.get("query", image_query),
+            images=image_result.get("images", [])
+        ))
+
+    return MediaSearchResponse(results=results)
+
+
+@app.post("/api/generate-ai-images", response_model=AIImageResponse)
+async def generate_ai_images(request: AIImageRequest):
+    """
+    Generate AI images for the video.
+    Used for on-demand AI image generation when user selects AI mode after initial generation.
+
+    Generates images for each scene with each model (3 models x N scenes).
     """
     try:
-        if not request.video_urls or len(request.video_urls) == 0:
-            raise HTTPException(status_code=400, detail="At least one video URL is required")
-        
-        if not request.audio_url:
-            raise HTTPException(status_code=400, detail="Audio URL is required")
-        
-        if not request.script or not request.script.strip():
-            raise HTTPException(status_code=400, detail="Script text is required for captions")
-        
-        # Create temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            
-            # Download audio
-            audio_data = None
-            if request.audio_url.startswith('data:audio'):
-                # Extract base64 audio data and detect format
-                audio_base64 = request.audio_url.split(',')[1]
-                audio_data = base64.b64decode(audio_base64)
-                # Detect audio format from data URL (e.g., data:audio/mp3;base64, or data:audio/wav;base64,)
-                if 'audio/mp3' in request.audio_url or 'audio/mpeg' in request.audio_url:
-                    audio_path = temp_path / "audio.mp3"
-                else:
-                    audio_path = temp_path / "audio.wav"
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_data)
-            else:
-                # Download audio from URL
-                audio_response = requests.get(request.audio_url, timeout=30)
-                if audio_response.status_code != 200:
-                    raise HTTPException(status_code=500, detail="Failed to download audio")
-                # Detect format from content-type header or URL
-                content_type = audio_response.headers.get('content-type', '')
-                if 'mp3' in content_type or 'mpeg' in content_type or request.audio_url.endswith('.mp3'):
-                    audio_path = temp_path / "audio.mp3"
-                else:
-                    audio_path = temp_path / "audio.wav"
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_response.content)
+        from image_generate import generate_image_for_video, FAL_AVAILABLE
 
-            # Download videos
-            video_paths = []
-            for i, video_url in enumerate(request.video_urls):
-                try:
-                    video_response = requests.get(video_url, timeout=30, stream=True)
-                    if video_response.status_code != 200:
-                        print(f"Warning: Failed to download video {i+1}: {video_url}")
-                        continue
-                    
-                    video_path = temp_path / f"video_{i+1}.mp4"
-                    with open(video_path, 'wb') as f:
-                        for chunk in video_response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    video_paths.append(str(video_path))
-                except Exception as e:
-                    print(f"Error downloading video {i+1}: {e}")
-                    continue
-            
-            if not video_paths:
-                raise HTTPException(status_code=500, detail="Failed to download any videos")
-            
-            # Calculate duration per scene (divide audio duration evenly)
-            # Get audio duration using ffprobe - CRITICAL: Must get actual duration, never default to 30
-            audio_duration = None
-            try:
-                probe_cmd = [
-                    FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                    '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)
-                ]
-                result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True, timeout=10)
-                duration_str = result.stdout.strip()
-                if duration_str:
-                    audio_duration = float(duration_str)
-                    print(f"✓ Audio duration detected: {audio_duration:.3f}s")
-                else:
-                    raise ValueError("Empty duration string from ffprobe")
-            except Exception as e:
-                print(f"✗ ERROR: Could not get audio duration: {e}")
-                print(f"   ffprobe stderr: {result.stderr if 'result' in locals() else 'N/A'}")
-                # Try alternative method: use ffmpeg to get duration
-                try:
-                    alt_cmd = [
-                        FFMPEG_EXECUTABLE, '-i', str(audio_path),
-                        '-f', 'null', '-'
-                    ]
-                    alt_result = subprocess.run(alt_cmd, capture_output=True, text=True, timeout=10)
-                    # Parse duration from ffmpeg output
-                    import re
-                    duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', alt_result.stderr)
-                    if duration_match:
-                        hours, minutes, seconds, centiseconds = duration_match.groups()
-                        audio_duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
-                        print(f"✓ Audio duration detected (alternative method): {audio_duration:.3f}s")
-                    else:
-                        raise ValueError("Could not parse duration from ffmpeg output")
-                except Exception as e2:
-                    print(f"✗ ERROR: Alternative duration detection also failed: {e2}")
-                    raise HTTPException(status_code=500, detail=f"Failed to determine audio duration: {e}. Please ensure audio file is valid.")
-            
-            if audio_duration is None or audio_duration <= 0:
-                raise HTTPException(status_code=500, detail="Invalid audio duration detected. Please check audio file.")
+        if not FAL_AVAILABLE:
+            raise HTTPException(status_code=503, detail="FAL_KEY not configured - AI image generation unavailable")
 
-            print(f"📹 Compiling video with {len(video_paths)} videos")
-            print(f"🎵 Audio duration: {audio_duration:.2f}s")
+        # Build sections list from request
+        sections = None
+        if request.sections:
+            sections = [{"name": s.name, "text": s.text} for s in request.sections]
 
-            # Calculate scene durations from alignment data and word boundaries
-            scene_durations: List[float] = []
+        result = await generate_image_for_video(
+            topic=request.topic,
+            script=request.script,
+            first_section_text=request.first_section_text,
+            sections=sections
+        )
 
-            if request.alignment and request.scenes and len(request.scenes) == len(video_paths):
-                # Check if all scenes have valid word boundaries
-                scenes_with_timing = [s for s in request.scenes if s.word_start is not None and s.word_end is not None]
-                if len(scenes_with_timing) == len(video_paths):
-                    print("📊 Calculating scene durations from alignment data...")
-                    scenes_data = [{'scene_number': s.scene_number, 'word_start': s.word_start, 'word_end': s.word_end}
-                                   for s in scenes_with_timing]
-                    scene_durations = calculate_scene_durations_from_alignment(
-                        request.alignment, scenes_data, audio_duration
-                    )
-                else:
-                    print(f"⚠ Only {len(scenes_with_timing)}/{len(video_paths)} scenes have word timing info")
+        # Convert to response format - include scene info
+        images = [
+            AIImageResult(
+                model_name=img.get("model_name", "Unknown"),
+                model_id=img.get("model_id", ""),
+                url=img.get("url"),
+                width=img.get("width"),
+                height=img.get("height"),
+                error=img.get("error"),
+                scene_number=img.get("scene_number"),
+                section_name=img.get("section_name")
+            )
+            for img in result.get("images", [])
+        ]
 
-            # Fallback to equal durations if calculation failed or no data
-            if not scene_durations or len(scene_durations) != len(video_paths):
-                print("📊 Using equal scene durations (fallback)")
-                equal_duration = audio_duration / len(video_paths)
-                scene_durations = [equal_duration] * len(video_paths)
-                print(f"⏱️  Scene duration per video: {equal_duration:.2f}s")
-            else:
-                print(f"✓ Using calculated scene durations: {[f'{d:.2f}s' for d in scene_durations]}")
+        return AIImageResponse(
+            images=images,
+            prompts=result.get("prompts")
+        )
 
-            print(f"📊 Total expected video duration: {sum(scene_durations):.2f}s")
-
-            # Trim each video to its calculated scene duration
-            trimmed_videos = []
-            for i, video_path in enumerate(video_paths):
-                scene_duration = scene_durations[i]
-                trimmed_path = temp_path / f"trimmed_video_{i+1}.mp4"
-                # Trim video to exact scene duration
-                trim_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(video_path),
-                    '-t', f'{scene_duration:.3f}',  # Trim to exact scene duration (3 decimal precision)
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-an',  # Remove audio from video clips (we'll add our audio later)
-                    str(trimmed_path)
-                ]
-                try:
-                    result = subprocess.run(trim_cmd, check=True, capture_output=True, timeout=30, text=True)
-                    trimmed_videos.append(trimmed_path)
-                    print(f"✓ Trimmed video {i+1} to {scene_duration:.2f}s")
-                except subprocess.CalledProcessError as e:
-                    # stderr is already a string when text=True is used
-                    error_msg = e.stderr if e.stderr else 'Unknown error'
-                    print(f"✗ Failed to trim video {i+1}: {error_msg[:200]}")
-                    raise HTTPException(status_code=500, detail=f"Failed to trim video {i+1} to {scene_duration:.2f}s")
-            
-            # Output video path
-            output_path = temp_path / "final_video.mp4"
-            
-            # Step 1: Concatenate trimmed videos and scale to vertical format
-            # Use filter_complex for reliable concatenation
-            if len(trimmed_videos) == 1:
-                # Single video - just scale it to vertical format
-                concat_video_path = temp_path / "concatenated.mp4"
-                scale_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(trimmed_videos[0]),
-                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-an',  # No audio
-                    str(concat_video_path)
-                ]
-                try:
-                    result = subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
-                    print(f"✓ Scaled single video to vertical format")
-                except subprocess.CalledProcessError as e:
-                    # stderr is already a string when text=True is used
-                    error_msg = e.stderr if e.stderr else 'Unknown error'
-                    print(f"✗ Failed to scale video: {error_msg[:200]}")
-                    raise HTTPException(status_code=500, detail="Failed to scale video")
-            else:
-                # Multiple videos - concatenate them and scale to vertical
-                concat_video_path = temp_path / "concatenated.mp4"
-                concat_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                ]
-                
-                # Add all input videos
-                for trimmed_path in trimmed_videos:
-                    concat_cmd.extend(['-i', str(trimmed_path)])
-                
-                # Build filter_complex: scale each to 1080x1920, then concatenate
-                filter_parts = []
-                # Scale all videos to same dimensions (1080x1920 for vertical)
-                for i in range(len(trimmed_videos)):
-                    filter_parts.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]")
-                
-                # Concatenate all scaled videos
-                concat_inputs = ''.join([f"[v{i}]" for i in range(len(trimmed_videos))])
-                filter_parts.append(f"{concat_inputs}concat=n={len(trimmed_videos)}:v=1:a=0[outv]")
-                
-                filter_complex = ';'.join(filter_parts)
-                
-                concat_cmd.extend([
-                    '-filter_complex', filter_complex,
-                    '-map', '[outv]',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    str(concat_video_path)
-                ])
-                
-                try:
-                    result = subprocess.run(concat_cmd, check=True, capture_output=True, timeout=180, text=True)
-                    expected_duration = scene_duration * len(trimmed_videos)
-                    print(f"✓ Concatenated {len(trimmed_videos)} videos")
-                    print(f"   Expected concatenated duration: {expected_duration:.2f}s")
-                    
-                    # Verify concatenated video duration
-                    try:
-                        probe_cmd = [
-                            FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                            '-of', 'default=noprint_wrappers=1:nokey=1', str(concat_video_path)
-                        ]
-                        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-                        actual_duration = float(probe_result.stdout.strip())
-                        print(f"   Actual concatenated duration: {actual_duration:.2f}s")
-                    except:
-                        pass
-                    
-                    if result.stderr:
-                        print(f"   Concat stderr: {result.stderr[:500]}")
-                except subprocess.CalledProcessError as e:
-                    # stderr is already a string when text=True is used
-                    error_msg = e.stderr if e.stderr else 'Unknown error'
-                    print(f"✗ FFmpeg concat error: {error_msg[:500]}")
-                    if e.stdout:
-                        print(f"   FFmpeg stdout: {e.stdout[:500]}")
-                    raise HTTPException(status_code=500, detail="Failed to concatenate videos")
-            
-            # Step 2: Generate subtitles with timing
-            # Priority: ElevenLabs alignment > Google TTS timepoints > Fallback
-            subtitle_path = None
-            script_text = request.script.strip()
-
-            # Import ElevenLabs subtitle function
-            try:
-                from subtitles import create_ass_from_elevenlabs_alignment
-            except ImportError:
-                create_ass_from_elevenlabs_alignment = None
-
-            # Check if ElevenLabs alignment data was provided
-            if request.alignment and request.tts_provider == "elevenlabs":
-                print(f"📝 Using ElevenLabs alignment for subtitles...")
-                try:
-                    # Convert dict back to object-like structure for the subtitle function
-                    class AlignmentData:
-                        def __init__(self, data):
-                            self.characters = data.get('characters', [])
-                            self.character_start_times_seconds = data.get('character_start_times_seconds', [])
-                            self.character_end_times_seconds = data.get('character_end_times_seconds', [])
-
-                    alignment_obj = AlignmentData(request.alignment)
-
-                    if create_ass_from_elevenlabs_alignment:
-                        ass_content = create_ass_from_elevenlabs_alignment(script_text, alignment_obj, audio_duration)
-                        subtitle_path = temp_path / "subtitles.ass"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(ass_content)
-                        print(f"✓ Created ASS subtitles from ElevenLabs alignment")
-                    else:
-                        print(f"⚠ ElevenLabs subtitle function not available, using fallback")
-                        ass_content = create_ass_fallback(script_text, audio_duration)
-                        subtitle_path = temp_path / "subtitles.ass"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(ass_content)
-                except Exception as e:
-                    print(f"⚠ Failed to generate ElevenLabs subtitles: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Fall through to Google TTS fallback
-
-            # Fallback to Google TTS for subtitle timing
-            if subtitle_path is None and TTS_AVAILABLE and tts_client and request.script:
-                try:
-                    print(f"📝 Generating subtitle timings from Google TTS (length: {len(script_text)} chars)...")
-                    selected_voice = request.voice_name if request.voice_name else "en-US-Neural2-H"
-                    _, timepoints = generate_tts_with_timing(script_text, voice_name=selected_voice)
-
-                    if timepoints:
-                        print(f"   Received {len(timepoints)} timepoints from Google TTS")
-                        if create_ass_from_timepoints:
-                            ass_content = create_ass_from_timepoints(script_text, timepoints, audio_duration, style="3words")
-                            subtitle_path = temp_path / "subtitles.ass"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(ass_content)
-                            print(f"✓ Created ASS subtitles from Google TTS timepoints")
-                        else:
-                            srt_content = create_srt_from_timepoints(script_text, timepoints, audio_duration, style="3words")
-                            subtitle_path = temp_path / "subtitles.srt"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(srt_content)
-                            print(f"✓ Created SRT subtitles from Google TTS timepoints")
-                    else:
-                        print(f"⚠ No Google TTS timepoints, using fallback timing")
-                        if create_ass_fallback:
-                            ass_content = create_ass_fallback(script_text, audio_duration)
-                            subtitle_path = temp_path / "subtitles.ass"
-                            with open(subtitle_path, 'w', encoding='utf-8') as f:
-                                f.write(ass_content)
-                except Exception as e:
-                    print(f"⚠ Failed to generate Google TTS subtitles: {e}")
-
-            # Final fallback: even timing
-            if subtitle_path is None and request.script:
-                try:
-                    print(f"📝 Using fallback even timing for subtitles...")
-                    if create_ass_fallback:
-                        ass_content = create_ass_fallback(script_text, audio_duration)
-                        subtitle_path = temp_path / "subtitles.ass"
-                        with open(subtitle_path, 'w', encoding='utf-8') as f:
-                            f.write(ass_content)
-                        print(f"✓ Created fallback ASS subtitles")
-                except Exception as e:
-                    print(f"⚠ Failed to create fallback subtitles: {e}")
-                    subtitle_path = None
-            
-            
-            # Step 2.5: Verify concatenated video duration and extend if needed
-            # Check actual concatenated video duration
-            try:
-                probe_concat_cmd = [
-                    FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                    '-of', 'default=noprint_wrappers=1:nokey=1', str(concat_video_path)
-                ]
-                probe_result = subprocess.run(probe_concat_cmd, capture_output=True, text=True, timeout=10)
-                concat_duration = float(probe_result.stdout.strip())
-                print(f"📊 Concatenated video duration: {concat_duration:.2f}s (audio: {audio_duration:.2f}s)")
-                
-                # If concatenated video is shorter than audio, extend it by looping the last frame
-                if concat_duration < audio_duration:
-                    extended_path = temp_path / "extended_concat.mp4"
-                    extend_duration = audio_duration - concat_duration
-                    # Use tpad to extend video with last frame
-                    extend_cmd = [
-                        FFMPEG_EXECUTABLE, '-y',
-                        '-i', str(concat_video_path),
-                        '-vf', f'tpad=stop_mode=clone:stop_duration={extend_duration:.3f}',
-                        '-c:v', 'libx264',
-                        '-preset', 'fast',
-                        '-an',
-                        str(extended_path)
-                    ]
-                    try:
-                        subprocess.run(extend_cmd, check=True, capture_output=True, timeout=30, text=True)
-                        concat_video_path = extended_path
-                        print(f"✓ Extended video to match audio duration ({audio_duration:.2f}s)")
-                    except Exception as e:
-                        print(f"⚠ Warning: Could not extend video: {e}")
-            except Exception as e:
-                print(f"⚠ Warning: Could not verify concatenated video duration: {e}")
-            
-            # Step 3: Add audio and burn captions to concatenated video
-            # Video duration should now match or exceed audio - use -t to match exactly
-            if subtitle_path and subtitle_path.exists():
-                # Build video filter with subtitles
-                # Escape path for Windows compatibility
-                subtitle_path_escaped = str(subtitle_path).replace('\\', '/').replace(':', '\\:')
-                
-                # Use appropriate filter based on subtitle format
-                if subtitle_path.suffix == '.ass':
-                    # Use ass= filter for ASS format (supports karaoke \k tags and professional styling)
-                    # Escape single quotes in path for shell safety
-                    subtitle_path_escaped_quotes = subtitle_path_escaped.replace("'", "'\\''")
-                    video_filter = f"ass='{subtitle_path_escaped_quotes}'"
-                    print(f"   Using ASS filter with path: {subtitle_path}")
-                    print(f"   Filter command: {video_filter}")
-                else:
-                    # Use subtitles= filter for SRT format
-                    subtitle_path_escaped_quotes = subtitle_path_escaped.replace("'", "'\\''")
-                    video_filter = f"subtitles='{subtitle_path_escaped_quotes}'"
-                final_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(concat_video_path),
-                    '-i', str(audio_path),
-                    '-vf', video_filter,
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-pix_fmt', 'yuv420p',  # Ensure TikTok-compatible color format
-                    '-colorspace', 'bt709',  # Standard color space for TikTok
-                    '-color_primaries', 'bt709',
-                    '-color_trc', 'bt709',
-                    '-c:a', 'copy',  # Copy audio without re-encoding (preserve quality)
-                    '-map', '0:v:0',
-                    '-map', '1:a:0',
-                    '-t', f'{audio_duration:.3f}',  # Force exact audio duration
-                    str(output_path)
-                ]
-                print(f"✓ Burning professional ASS captions into video from {subtitle_path}")
-                # Debug: Print first few lines of ASS file to verify it's correct
-                try:
-                    with open(subtitle_path, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()[:15]
-                        print(f"   ASS file preview (first 15 lines):")
-                        for line in lines:
-                            print(f"     {line.rstrip()}")
-                except Exception as e:
-                    print(f"   Could not read ASS file for preview: {e}")
-            else:
-                # No subtitles, just add audio
-                final_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(concat_video_path),
-                    '-i', str(audio_path),
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',
-                    '-map', '0:v:0',
-                    '-map', '1:a:0',
-                    '-t', f'{audio_duration:.3f}',  # Force exact audio duration
-                    str(output_path)
-                ]
-            
-            try:
-                print(f"   Running FFmpeg command: {' '.join(final_cmd[:5])}... [truncated]")
-                result = subprocess.run(final_cmd, check=True, capture_output=True, timeout=180, text=True)
-                print(f"✓ Final video created with audio and subtitles")
-                print(f"   Target duration: {audio_duration:.2f}s")
-                
-                # Check for subtitle-related warnings in stderr
-                if result.stderr:
-                    stderr_lower = result.stderr.lower()
-                    if 'font' in stderr_lower or 'subtitle' in stderr_lower or 'ass' in stderr_lower or 'libass' in stderr_lower:
-                        print(f"   ⚠ Subtitle-related warnings: {result.stderr[:1000]}")
-                
-                # Verify final video duration
-                try:
-                    probe_cmd = [
-                        FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                        '-of', 'default=noprint_wrappers=1:nokey=1', str(output_path)
-                    ]
-                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-                    final_duration = float(probe_result.stdout.strip())
-                    print(f"   Actual final duration: {final_duration:.2f}s")
-                except:
-                    pass
-                
-                if result.stderr:
-                    print(f"   Final stderr: {result.stderr[:500]}")
-            except subprocess.CalledProcessError as e:
-                # stderr is already a string when text=True is used
-                error_msg = e.stderr if e.stderr else 'Unknown error'
-                print(f"✗ FFmpeg final error: {error_msg[:500]}")
-                if e.stdout:
-                    print(f"   FFmpeg stdout: {e.stdout[:500]}")
-                raise HTTPException(status_code=500, detail="Failed to combine video and audio")
-            
-            # Read the final video and return as base64
-            with open(output_path, 'rb') as f:
-                video_data = f.read()
-            
-            video_base64 = base64.b64encode(video_data).decode('utf-8')
-            video_data_url = f"data:video/mp4;base64,{video_base64}"
-            
-            return CompileVideoResponse(video_url=video_data_url)
-    
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Video compilation error: {e}")
+        print(f"AI image generation error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Video compilation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI image generation failed: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+

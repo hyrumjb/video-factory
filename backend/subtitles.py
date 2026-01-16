@@ -1,5 +1,146 @@
 import re
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+
+# ============================================================================
+# ADAPTIVE CAPTION GROUPING CONSTANTS (CapCut-style)
+# ============================================================================
+MAX_WORDS = 3
+MIN_WORDS = 1
+
+FAST_WPS = 4.5   # Words per second threshold for fast speech
+SLOW_WPS = 2.5   # Words per second threshold for slow speech
+
+SHORT_GAP = 0.12  # Short pause between words
+LONG_GAP = 0.30   # Long pause - triggers caption break
+
+MAX_GROUP_DUR = 0.60  # Maximum caption group duration
+MIN_GROUP_DUR = 0.18  # Minimum caption group duration
+
+LONG_WORD_DUR = 0.38  # Emphasized word duration threshold (solo caption)
+
+# Words that shouldn't end a caption group (connectors/prepositions)
+BAD_ENDINGS = {
+    "of", "to", "and", "or", "the", "a", "an",
+    "in", "on", "for", "with", "at", "by", "from",
+    "is", "are", "was", "were", "be", "been",
+    "that", "this", "these", "those",
+}
+
+
+def local_wps(words: List[Dict], i: int, win: int = 5) -> float:
+    """Calculate local words-per-second around position i."""
+    s = max(0, i - win)
+    e = min(len(words), i + win)
+    if e <= s:
+        return 3.0  # Default middle speed
+    dur = words[e - 1]['end'] - words[s]['start']
+    return (e - s) / max(dur, 0.01)
+
+
+def adaptive_group_words(words: List[Dict]) -> List[List[Dict]]:
+    """
+    Adaptive 1-3 word caption grouping (CapCut-style).
+
+    Input: list of words with {word, start, end}
+    Output: list of caption groups, each group is a list of word dicts
+
+    Features:
+    - Speech-speed aware (faster speech = more words per caption)
+    - Pause-aware (long gaps trigger breaks)
+    - Emphasis-aware (long words get solo captions)
+    - Avoids dangling connectors/prepositions
+    """
+    if not words:
+        return []
+
+    # Add duration and gap to each word
+    for i, w in enumerate(words):
+        w['dur'] = w['end'] - w['start']
+        if i < len(words) - 1:
+            w['gap'] = words[i + 1]['start'] - w['end']
+        else:
+            w['gap'] = 999  # Last word has no gap
+
+    groups: List[List[Dict]] = []
+    cur: List[Dict] = []
+    group_start: Optional[float] = None
+
+    for i, w in enumerate(words):
+        # Long/emphasized word → solo caption
+        if w['dur'] >= LONG_WORD_DUR:
+            if cur:
+                groups.append(cur)
+            groups.append([w])
+            cur = []
+            group_start = None
+            continue
+
+        if not cur:
+            cur = [w]
+            group_start = w['start']
+            continue
+
+        wps = local_wps(words, i)
+
+        # Adaptive target words based on speech speed
+        if wps >= FAST_WPS:
+            target = 3
+        elif wps <= SLOW_WPS:
+            target = 1
+        else:
+            target = 2
+
+        group_dur = w['end'] - group_start if group_start else 0
+
+        # Decide if we should break to a new group
+        should_break = (
+            len(cur) >= target or
+            group_dur >= MAX_GROUP_DUR or
+            w['gap'] >= LONG_GAP
+        )
+
+        if should_break:
+            groups.append(cur)
+            cur = [w]
+            group_start = w['start']
+        else:
+            cur.append(w)
+
+    # Don't forget the last group
+    if cur:
+        groups.append(cur)
+
+    # Post-processing
+    fixed: List[List[Dict]] = []
+    for g in groups:
+        if not g:
+            continue
+
+        dur = g[-1]['end'] - g[0]['start']
+
+        # Avoid dangling connectors - merge with previous group
+        last_word = g[-1]['word'].lower().rstrip('.,!?;:')
+        if last_word in BAD_ENDINGS and fixed and len(g) == 1:
+            fixed[-1].extend(g)
+            continue
+
+        # Merge too-short captions with previous
+        if dur < MIN_GROUP_DUR and fixed:
+            fixed[-1].extend(g)
+        else:
+            fixed.append(g)
+
+    # Final pass: ensure no group exceeds MAX_WORDS
+    final: List[List[Dict]] = []
+    for g in fixed:
+        while len(g) > MAX_WORDS:
+            final.append(g[:MAX_WORDS])
+            g = g[MAX_WORDS:]
+        if g:
+            final.append(g)
+
+    return final
+
 
 def convert_elevenlabs_alignment_to_word_timings(text: str, alignment) -> list:
     """
@@ -83,7 +224,7 @@ def convert_elevenlabs_alignment_to_word_timings(text: str, alignment) -> list:
 def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration: float) -> str:
     """
     Create ASS subtitle file from ElevenLabs alignment data.
-    Uses the same state-based karaoke style as Google TTS version.
+    Uses adaptive 1-3 word grouping (CapCut-style) and state-based karaoke highlighting.
     """
     word_timings = convert_elevenlabs_alignment_to_word_timings(script, alignment)
 
@@ -95,6 +236,17 @@ def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration:
     print(f"📝 Script length: {len(script)} chars")
     print(f"⏱️  Audio duration: {audio_duration:.2f}s")
     print(f"🔢 Word timings: {len(word_timings)}")
+
+    # Use adaptive grouping algorithm (CapCut-style)
+    caption_groups = adaptive_group_words(word_timings)
+    print(f"📊 Adaptive grouping: {len(caption_groups)} caption groups")
+
+    # Debug: show group sizes distribution
+    group_sizes = {}
+    for g in caption_groups:
+        size = len(g)
+        group_sizes[size] = group_sizes.get(size, 0) + 1
+    print(f"   Group sizes: {group_sizes}")
 
     # ASS file header (same styling as Google TTS version)
     ass_lines = [
@@ -110,36 +262,18 @@ def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration:
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    def format_ass_time(seconds):
+    def format_ass_time(seconds: float) -> str:
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
         centiseconds = int((seconds % 1) * 100)
         return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
 
-    def is_sentence_ending(word: str) -> bool:
-        return bool(re.search(r'[.!?]+$', word))
-
-    # Group words into 1-3 word phrases
-    max_words_per_subtitle = 3
-    i = 0
     global_end_time = 0.0
 
-    while i < len(word_timings):
-        # Build phrase (1-3 words, stop at sentence endings)
-        phrase_timings = []
-        start_idx = i
-
-        while len(phrase_timings) < max_words_per_subtitle and i < len(word_timings):
-            phrase_timings.append(word_timings[i])
-            i += 1
-
-            # Stop at sentence endings
-            if is_sentence_ending(phrase_timings[-1]['word']):
-                break
-
+    for group_idx, phrase_timings in enumerate(caption_groups):
         if not phrase_timings:
-            break
+            continue
 
         # Generate state-based karaoke: one dialogue line per word
         # Extend each word's end time to meet the next word's start to prevent flashing
@@ -148,8 +282,10 @@ def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration:
             for word_idx, wt in enumerate(phrase_timings):
                 word = wt['word']
                 if word_idx == highlight_idx:
+                    # Highlighted word (yellow)
                     text_parts.append(f"{{\\1c&H0000FFFF&}}{word}")
                 else:
+                    # Non-highlighted word (white)
                     text_parts.append(f"{{\\1c&H00FFFFFF&}}{word}")
 
             karaoke_text = "{\\an2}" + " ".join(text_parts)
@@ -163,10 +299,14 @@ def create_ass_from_elevenlabs_alignment(script: str, alignment, audio_duration:
                 next_timing = phrase_timings[highlight_idx + 1]
                 line_end = next_timing['start']
             else:
-                # Last word in phrase - check if there's a next phrase
-                if i < len(word_timings):
-                    # Extend to next phrase's first word
-                    line_end = word_timings[i]['start']
+                # Last word in phrase - check if there's a next group
+                if group_idx < len(caption_groups) - 1:
+                    # Extend to next group's first word
+                    next_group = caption_groups[group_idx + 1]
+                    if next_group:
+                        line_end = next_group[0]['start']
+                    else:
+                        line_end = timing['end']
                 else:
                     # Last word overall - use its natural end time
                     line_end = timing['end']
