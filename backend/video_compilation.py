@@ -142,8 +142,8 @@ def _process_media_segment(
                 '-i', str(input_path),
                 '-vf', zoompan_filter,
                 '-t', f'{duration:.3f}',  # Force exact output duration
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 '-pix_fmt', 'yuv420p',
                 '-an',
                 str(output_path)
@@ -158,8 +158,8 @@ def _process_media_segment(
                     '-loop', '1',
                     '-i', str(input_path),
                     '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-c:v', 'libx264',
-                    '-b:v', '5000k',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                    '-b:v', '3000k',
                     '-pix_fmt', 'yuv420p',
                     '-t', f'{duration:.3f}',
                     '-r', '30',
@@ -175,8 +175,8 @@ def _process_media_segment(
                 '-i', str(input_path),
                 '-t', f'{duration:.3f}',
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 '-an',
                 str(output_path)
             ]
@@ -209,8 +209,8 @@ def _concatenate_segments(segment_paths: List[Path], output_path: Path) -> None:
     cmd.extend([
         '-filter_complex', ';'.join(filter_parts),
         '-map', '[outv]',
-        '-c:v', 'libx264',
-        '-b:v', '5000k',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+        '-b:v', '3000k',
         str(output_path)
     ])
 
@@ -301,8 +301,8 @@ def _finalize_video(
             '-i', str(video_path),
             '-i', str(audio_path),
             '-vf', video_filter,
-            '-c:v', 'libx264',
-            '-b:v', '5000k',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+            '-b:v', '3000k',
             '-c:a', 'aac',
             '-b:a', '192k',
             '-map', '0:v:0',
@@ -315,8 +315,8 @@ def _finalize_video(
             FFMPEG_EXECUTABLE, '-y',
             '-i', str(video_path),
             '-i', str(audio_path),
-            '-c:v', 'libx264',
-            '-b:v', '5000k',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+            '-b:v', '3000k',
             '-c:a', 'aac',
             '-b:a', '192k',
             '-map', '0:v:0',
@@ -512,8 +512,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-vf', zoompan_filter,
-                    '-c:v', 'libx264',
-                    '-b:v', '5000k',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                    '-b:v', '3000k',
                     '-pix_fmt', 'yuv420p',
                     '-an',
                     str(trimmed_path)
@@ -533,8 +533,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                         '-loop', '1',
                         '-i', str(media_path),
                         '-vf', f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                        '-c:v', 'libx264',
-                        '-b:v', '5000k',
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                        '-b:v', '3000k',
                         '-pix_fmt', 'yuv420p',
                         '-t', f'{scene_duration:.3f}',
                         '-r', str(fps),
@@ -555,8 +555,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-t', f'{scene_duration:.3f}',
-                    '-c:v', 'libx264',
-                    '-b:v', '5000k',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                    '-b:v', '3000k',
                     '-an',
                     str(trimmed_path)
                 ]
@@ -580,8 +580,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(trimmed_videos[0]),
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 '-an',
                 str(concat_video_path)
             ]
@@ -616,8 +616,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             concat_cmd.extend([
                 '-filter_complex', filter_complex,
                 '-map', '[outv]',
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 str(concat_video_path)
             ])
             
@@ -708,8 +708,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
                 '-vf', video_filter,
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
                 '-map', '0:v:0',
@@ -724,8 +724,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
-                '-c:v', 'libx264',
-                '-b:v', '5000k',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+                '-b:v', '3000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
                 '-map', '0:v:0',

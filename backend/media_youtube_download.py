@@ -213,8 +213,8 @@ def clip_from_source(
             FFMPEG_EXECUTABLE, '-y',
             '-i', temp_clip,
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'libx264',
-            '-b:v', '5000k',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+            '-b:v', '3000k',
             '-an',
             output_path
         ]
@@ -255,8 +255,8 @@ def _direct_encode_clip(
             '-i', source_path,
             '-t', str(duration),
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'libx264',
-            '-b:v', '5000k',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+            '-b:v', '3000k',
             '-an',
             output_path
         ]
@@ -522,15 +522,15 @@ def download_youtube_clip(
         print("      Converting to vertical format...")
 
         # Convert to vertical format (letterbox style)
-        # Use VideoToolbox hardware acceleration for fast encoding on Mac
+        # Use libx264 with ultrafast preset for low memory usage
         # Limit to clip_duration to handle cases where download_sections didn't work
         convert_cmd = [
             FFMPEG_EXECUTABLE, '-y',
             '-t', str(clip_duration),  # Limit input duration (in case download_sections failed)
             '-i', temp_path,
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'libx264',  # Hardware acceleration on Mac
-            '-b:v', '5000k',  # Bitrate for quality
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+            '-b:v', '3000k',
             '-an',  # No audio needed for background
             output_path
         ]
