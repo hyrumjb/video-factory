@@ -22,7 +22,6 @@ from pathlib import Path
 # Import shared configuration
 from config import (
     FFMPEG_EXECUTABLE,
-    FFPROBE_EXECUTABLE,
     TTS_AVAILABLE,
     tts_client,
     texttospeech,
@@ -235,6 +234,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "tts_available": TTS_AVAILABLE,
+        "elevenlabs_available": ELEVENLABS_AVAILABLE,
+        "xai_available": xai_client is not None,
+    }
 
 # Log TTS status
 if TTS_AVAILABLE and tts_client:
@@ -486,7 +495,14 @@ async def create_video_stream(
                 }
                 break
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 def list_available_voices(language_code: str = "en-US"):

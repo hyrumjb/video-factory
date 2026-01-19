@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import subprocess
 from typing import Dict, Any, List, Optional
-from config import xai_client, FFMPEG_EXECUTABLE, FFPROBE_EXECUTABLE, XAI_MODEL
+from config import xai_client, FFMPEG_EXECUTABLE, XAI_MODEL, get_media_duration
 
 
 # Persistent cache directory (survives across runs)
@@ -213,7 +213,7 @@ def clip_from_source(
             FFMPEG_EXECUTABLE, '-y',
             '-i', temp_clip,
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'h264_videotoolbox',
+            '-c:v', 'libx264',
             '-b:v', '5000k',
             '-an',
             output_path
@@ -255,7 +255,7 @@ def _direct_encode_clip(
             '-i', source_path,
             '-t', str(duration),
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'h264_videotoolbox',
+            '-c:v', 'libx264',
             '-b:v', '5000k',
             '-an',
             output_path
@@ -510,15 +510,7 @@ def download_youtube_clip(
 
         # Get actual duration of downloaded file
         try:
-            probe_cmd = [
-                FFPROBE_EXECUTABLE,
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                temp_path
-            ]
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-            actual_duration = float(probe_result.stdout.strip()) if probe_result.stdout.strip() else 0
+            actual_duration = get_media_duration(temp_path)
             print(f"      Actual duration: {actual_duration:.1f}s")
 
             # If file is way longer than expected, warn
@@ -537,7 +529,7 @@ def download_youtube_clip(
             '-t', str(clip_duration),  # Limit input duration (in case download_sections failed)
             '-i', temp_path,
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-            '-c:v', 'h264_videotoolbox',  # Hardware acceleration on Mac
+            '-c:v', 'libx264',  # Hardware acceleration on Mac
             '-b:v', '5000k',  # Bitrate for quality
             '-an',  # No audio needed for background
             output_path

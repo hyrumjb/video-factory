@@ -41,7 +41,7 @@ OUTPUT FORMAT:
 - NO formatting markers
 - Just pure, flowing spoken text ready for TTS"""
 
-    user_message = f"""Create an 100-120 word TikTok video script about: {topic}"""
+    user_message = f"""Create a 120 word TikTok video script about: {topic}"""
 
     print(f"🎬 Generating script for topic: {topic}")
 

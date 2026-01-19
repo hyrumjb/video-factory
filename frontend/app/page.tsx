@@ -201,13 +201,30 @@ export default function Home() {
       </header>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col items-center justify-start pt-40 px-6">
-        <div className="w-full max-w-xl space-y-8">
-          <h1 className="text-4xl md:text-5xl font-semibold text-center tracking-tight text-white">
-            Create beautiful videos with zero effort
-          </h1>
+      <main className="flex-1 flex flex-col items-center justify-start pt-8 md:pt-16 px-6">
+        <div className="w-full max-w-7xl flex items-center justify-center gap-16 lg:gap-28">
+          {/* Left iPhone mockup - hidden on small screens */}
+          <div className="hidden lg:block flex-shrink-0">
+            <div className="iphone-frame">
+              <div className="iphone-notch" />
+              <video
+                src="/sample1.mp4"
+                autoPlay
+                loop
+                muted
+                playsInline
+                className="iphone-video"
+              />
+            </div>
+          </div>
 
-          <form onSubmit={handleSubmit}>
+          {/* Center content */}
+          <div className="w-full max-w-xl space-y-8">
+            <h1 className="text-4xl md:text-5xl font-semibold text-center tracking-tight text-white">
+              Create beautiful videos with zero effort
+            </h1>
+
+            <form onSubmit={handleSubmit}>
             {/* Input card with animated gradient border */}
             <div className="gradient-border-wrapper">
               <div className="bg-[#27272a] rounded-[calc(1.5rem-4px)] p-4">
@@ -312,6 +329,22 @@ export default function Home() {
               </div>
             </div>
           </form>
+          </div>
+
+          {/* Right iPhone mockup - hidden on small screens */}
+          <div className="hidden lg:block flex-shrink-0">
+            <div className="iphone-frame">
+              <div className="iphone-notch" />
+              <video
+                src="/sample2.mp4"
+                autoPlay
+                loop
+                muted
+                playsInline
+                className="iphone-video"
+              />
+            </div>
+          </div>
         </div>
       </main>
 

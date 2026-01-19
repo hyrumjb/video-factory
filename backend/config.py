@@ -93,6 +93,36 @@ except ImportError:
     # Fallback to system ffmpeg if imageio-ffmpeg not available
     pass
 
+
+def get_media_duration(file_path: str) -> float:
+    """
+    Get media duration using ffmpeg (more portable than ffprobe).
+    Works on both Mac and Linux without needing ffprobe installed.
+    """
+    import re
+    import subprocess
+
+    try:
+        cmd = [FFMPEG_EXECUTABLE, '-i', file_path, '-f', 'null', '-']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        output = result.stderr
+
+        # Look for "Duration: HH:MM:SS.ms" pattern
+        match = re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', output)
+        if match:
+            hours, minutes, seconds, centiseconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
+
+        # Fallback: look for "time=" at the end
+        match = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', output)
+        if match:
+            hours, minutes, seconds, centiseconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
+
+        raise ValueError("Could not parse duration from ffmpeg output")
+    except Exception as e:
+        raise RuntimeError(f"Failed to get media duration: {e}")
+
 # Google TTS configuration
 TTS_AVAILABLE: bool = False
 texttospeech: Optional[Any] = None

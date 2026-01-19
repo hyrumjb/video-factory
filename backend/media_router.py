@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
-from config import xai_client, XAI_MODEL, FFPROBE_EXECUTABLE
+from config import xai_client, XAI_MODEL, get_media_duration
 
 
 class MediaType(str, Enum):
@@ -711,12 +711,7 @@ def _get_video_duration(media_url: str) -> Optional[float]:
         if not path.exists():
             return None
         try:
-            probe_cmd = [
-                FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', str(path)
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-            return float(result.stdout.strip())
+            return get_media_duration(str(path))
         except Exception:
             return None
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
 from models import CompileVideoRequest, CompileVideoResponse
-from config import FFMPEG_EXECUTABLE, FFPROBE_EXECUTABLE, TTS_AVAILABLE, tts_client
+from config import FFMPEG_EXECUTABLE, TTS_AVAILABLE, tts_client, get_media_duration
 from tts import generate_tts_with_timing
 from subtitles import create_ass_from_timepoints, create_ass_fallback, create_ass_from_elevenlabs_alignment
 
@@ -39,14 +39,29 @@ async def _download_audio(audio_url: str, temp_path: Path) -> Path:
 
 
 def _get_audio_duration(audio_path: Path) -> float:
-    """Get audio duration using ffprobe."""
+    """Get audio duration using ffmpeg (more portable than ffprobe)."""
+    import re
     try:
+        # Use ffmpeg -i to get duration (works without ffprobe)
         probe_cmd = [
-            FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)
+            FFMPEG_EXECUTABLE, '-i', str(audio_path), '-f', 'null', '-'
         ]
-        result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True, timeout=10)
-        return float(result.stdout.strip())
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        # Parse duration from stderr (ffmpeg outputs info to stderr)
+        output = result.stderr
+        # Look for "Duration: HH:MM:SS.ms" pattern
+        match = re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', output)
+        if match:
+            hours, minutes, seconds, centiseconds = match.groups()
+            duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
+            return duration
+        # Fallback: look for "time=" at the end
+        match = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', output)
+        if match:
+            hours, minutes, seconds, centiseconds = match.groups()
+            duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
+            return duration
+        raise ValueError(f"Could not parse duration from ffmpeg output")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get audio duration: {e}")
 
@@ -127,7 +142,7 @@ def _process_media_segment(
                 '-i', str(input_path),
                 '-vf', zoompan_filter,
                 '-t', f'{duration:.3f}',  # Force exact output duration
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 '-pix_fmt', 'yuv420p',
                 '-an',
@@ -143,7 +158,7 @@ def _process_media_segment(
                     '-loop', '1',
                     '-i', str(input_path),
                     '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-c:v', 'h264_videotoolbox',
+                    '-c:v', 'libx264',
                     '-b:v', '5000k',
                     '-pix_fmt', 'yuv420p',
                     '-t', f'{duration:.3f}',
@@ -160,7 +175,7 @@ def _process_media_segment(
                 '-i', str(input_path),
                 '-t', f'{duration:.3f}',
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 '-an',
                 str(output_path)
@@ -194,7 +209,7 @@ def _concatenate_segments(segment_paths: List[Path], output_path: Path) -> None:
     cmd.extend([
         '-filter_complex', ';'.join(filter_parts),
         '-map', '[outv]',
-        '-c:v', 'h264_videotoolbox',
+        '-c:v', 'libx264',
         '-b:v', '5000k',
         str(output_path)
     ])
@@ -210,12 +225,7 @@ def _concatenate_segments(segment_paths: List[Path], output_path: Path) -> None:
 def _check_video_duration(video_path: Path, audio_duration: float) -> None:
     """Check video duration and log warning if shorter than audio (but don't extend - replacement happens earlier)."""
     try:
-        probe_cmd = [
-            FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
-        ]
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-        video_duration = float(result.stdout.strip())
+        video_duration = get_media_duration(str(video_path))
 
         if video_duration < audio_duration:
             diff = audio_duration - video_duration
@@ -291,7 +301,7 @@ def _finalize_video(
             '-i', str(video_path),
             '-i', str(audio_path),
             '-vf', video_filter,
-            '-c:v', 'h264_videotoolbox',
+            '-c:v', 'libx264',
             '-b:v', '5000k',
             '-c:a', 'aac',
             '-b:a', '192k',
@@ -305,7 +315,7 @@ def _finalize_video(
             FFMPEG_EXECUTABLE, '-y',
             '-i', str(video_path),
             '-i', str(audio_path),
-            '-c:v', 'h264_videotoolbox',
+            '-c:v', 'libx264',
             '-b:v', '5000k',
             '-c:a', 'aac',
             '-b:a', '192k',
@@ -447,39 +457,14 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         if not video_paths:
             raise HTTPException(status_code=500, detail="Failed to download any media")
         
-        # Get audio duration using ffprobe
+        # Get audio duration using ffmpeg
         audio_duration = None
         try:
-            probe_cmd = [
-                FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)
-            ]
-            result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True, timeout=10)
-            duration_str = result.stdout.strip()
-            if duration_str:
-                audio_duration = float(duration_str)
-                print(f"✓ Audio duration detected: {audio_duration:.3f}s")
-            else:
-                raise ValueError("Empty duration string from ffprobe")
+            audio_duration = get_media_duration(str(audio_path))
+            print(f"✓ Audio duration detected: {audio_duration:.3f}s")
         except Exception as e:
             print(f"✗ ERROR: Could not get audio duration: {e}")
-            try:
-                alt_cmd = [
-                    FFMPEG_EXECUTABLE, '-i', str(audio_path),
-                    '-f', 'null', '-'
-                ]
-                alt_result = subprocess.run(alt_cmd, capture_output=True, text=True, timeout=10)
-                import re
-                duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', alt_result.stderr)
-                if duration_match:
-                    hours, minutes, seconds, centiseconds = duration_match.groups()
-                    audio_duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centiseconds) / 100
-                    print(f"✓ Audio duration detected (alternative method): {audio_duration:.3f}s")
-                else:
-                    raise ValueError("Could not parse duration from ffmpeg output")
-            except Exception as e2:
-                print(f"✗ ERROR: Alternative duration detection also failed: {e2}")
-                raise HTTPException(status_code=500, detail=f"Failed to determine audio duration: {e}. Please ensure audio file is valid.")
+            raise HTTPException(status_code=500, detail=f"Failed to determine audio duration: {e}. Please ensure audio file is valid.")
         
         if audio_duration is None or audio_duration <= 0:
             raise HTTPException(status_code=500, detail="Invalid audio duration detected. Please check audio file.")
@@ -527,7 +512,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-vf', zoompan_filter,
-                    '-c:v', 'h264_videotoolbox',
+                    '-c:v', 'libx264',
                     '-b:v', '5000k',
                     '-pix_fmt', 'yuv420p',
                     '-an',
@@ -548,7 +533,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                         '-loop', '1',
                         '-i', str(media_path),
                         '-vf', f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                        '-c:v', 'h264_videotoolbox',
+                        '-c:v', 'libx264',
                         '-b:v', '5000k',
                         '-pix_fmt', 'yuv420p',
                         '-t', f'{scene_duration:.3f}',
@@ -570,7 +555,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-t', f'{scene_duration:.3f}',
-                    '-c:v', 'h264_videotoolbox',
+                    '-c:v', 'libx264',
                     '-b:v', '5000k',
                     '-an',
                     str(trimmed_path)
@@ -595,7 +580,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(trimmed_videos[0]),
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 '-an',
                 str(concat_video_path)
@@ -631,7 +616,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             concat_cmd.extend([
                 '-filter_complex', filter_complex,
                 '-map', '[outv]',
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 str(concat_video_path)
             ])
@@ -703,12 +688,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         
         # Step 2.5: Verify concatenated video duration (don't extend - just log)
         try:
-            probe_concat_cmd = [
-                FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', str(concat_video_path)
-            ]
-            probe_result = subprocess.run(probe_concat_cmd, capture_output=True, text=True, timeout=10)
-            concat_duration = float(probe_result.stdout.strip())
+            concat_duration = get_media_duration(str(concat_video_path))
             print(f"📊 Concatenated video duration: {concat_duration:.2f}s (audio: {audio_duration:.2f}s)")
 
             if concat_duration < audio_duration:
@@ -728,7 +708,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
                 '-vf', video_filter,
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
@@ -744,7 +724,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
-                '-c:v', 'h264_videotoolbox',
+                '-c:v', 'libx264',
                 '-b:v', '5000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
