@@ -22,25 +22,25 @@ body {
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 10%;
-    --card: 0 0% 100%;
-    --card-foreground: 240 10% 10%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 10%;
-    --primary: 240 10% 10%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 0 0% 96%;
-    --secondary-foreground: 240 10% 10%;
-    --muted: 240 5% 96%;
-    --muted-foreground: 240 4% 46%;
-    --accent: 240 5% 96%;
-    --accent-foreground: 240 10% 10%;
+    --background: 240 6% 4%;
+    --foreground: 0 0% 95%;
+    --card: 240 5% 7%;
+    --card-foreground: 0 0% 95%;
+    --popover: 240 5% 7%;
+    --popover-foreground: 0 0% 95%;
+    --primary: 0 0% 95%;
+    --primary-foreground: 240 6% 4%;
+    --secondary: 240 4% 12%;
+    --secondary-foreground: 0 0% 95%;
+    --muted: 240 4% 12%;
+    --muted-foreground: 240 5% 55%;
+    --accent: 240 4% 12%;
+    --accent-foreground: 0 0% 95%;
     --destructive: 0 84% 60%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 6% 90%;
-    --input: 240 6% 90%;
-    --ring: 240 10% 10%;
+    --border: 240 4% 14%;
+    --input: 240 4% 14%;
+    --ring: 0 0% 95%;
     --radius: 1rem;
   }
 }
@@ -91,7 +91,7 @@ body {
   position: absolute;
   inset: 4px;
   border-radius: calc(1.5rem - 4px);
-  background: white;
+  background: #27272a;
   z-index: 0;
 }
 
@@ -123,5 +123,38 @@ body {
     100% {
       background-position: 300% 50%;
     }
+  }
+}
+
+/* Logo text with rainbow gradient hover effect */
+.logo-text {
+  transition: all 0.3s ease;
+  background-clip: text;
+  -webkit-background-clip: text;
+}
+
+.logo-text:hover {
+  background: linear-gradient(
+    90deg,
+    #2AF5FF,
+    #FF2AEF,
+    #FFD22A,
+    #A2FF2A,
+    #6B57FF,
+    #2AF5FF
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: gradient-flow 4s linear infinite;
+}
+
+@keyframes gradient-flow {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
   }
 }

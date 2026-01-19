@@ -70,14 +70,26 @@ if TTS_AVAILABLE:
     except Exception:
         tts_client = None
 
-# OpenAI client
-openai_client: Optional[Any] = None
+# xAI (Grok) client
+# Uses the OpenAI SDK (xAI's API is OpenAI-compatible)
+xai_client: Optional[Any] = None
+XAI_MODEL: str = "grok-4-1-fast-reasoning"
 
 try:
     from openai import OpenAI
-    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    xai_api_key = os.getenv("XAI_API_KEY")
+    if xai_api_key:
+        xai_client = OpenAI(
+            api_key=xai_api_key,
+            base_url="https://api.x.ai/v1"
+        )
+        print(f"✓ xAI (Grok) client initialized with model: {XAI_MODEL}")
+    else:
+        print("⚠ XAI_API_KEY not set - LLM features disabled")
 except ImportError:
-    openai_client = None
+    print("⚠ openai package not installed - needed for xAI client")
+    xai_client = None
+
 
 # ElevenLabs configuration
 ELEVENLABS_API_KEY: Optional[str] = os.getenv("ELEVENLABS_API_KEY")

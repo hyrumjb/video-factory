@@ -1,4 +1,5 @@
 import base64
+import os
 import tempfile
 import subprocess
 import requests
@@ -11,196 +12,331 @@ from tts import generate_tts_with_timing
 from subtitles import create_ass_from_timepoints, create_ass_fallback, create_ass_from_elevenlabs_alignment
 
 
-def calculate_scene_durations_from_alignment(
-    alignment: Dict[str, Any],
-    scenes: List[Dict[str, Any]],
-    audio_duration: float,
-    script: Optional[str] = None
-) -> List[float]:
-    """
-    Calculate scene durations from ElevenLabs alignment data and scene word boundaries.
 
-    Args:
-        alignment: ElevenLabs alignment dict with 'characters', 'character_start_times_seconds', 'character_end_times_seconds'
-        scenes: List of scene dicts with 'scene_number', 'word_start', 'word_end'
-        audio_duration: Total audio duration in seconds
-        script: Optional script text to verify word count matches
+async def _download_audio(audio_url: str, temp_path: Path) -> Path:
+    """Download audio from URL or base64 data."""
+    if audio_url.startswith('data:audio'):
+        audio_base64 = audio_url.split(',')[1]
+        audio_data = base64.b64decode(audio_base64)
+        if 'audio/mp3' in audio_url or 'audio/mpeg' in audio_url:
+            audio_path = temp_path / "audio.mp3"
+        else:
+            audio_path = temp_path / "audio.wav"
+        with open(audio_path, 'wb') as f:
+            f.write(audio_data)
+    else:
+        response = requests.get(audio_url, timeout=30)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to download audio")
+        content_type = response.headers.get('content-type', '')
+        if 'mp3' in content_type or 'mpeg' in content_type or audio_url.endswith('.mp3'):
+            audio_path = temp_path / "audio.mp3"
+        else:
+            audio_path = temp_path / "audio.wav"
+        with open(audio_path, 'wb') as f:
+            f.write(response.content)
+    return audio_path
 
-    Returns:
-        List of durations in seconds for each scene
-    """
-    if not alignment or not scenes:
-        print(f"⚠ Missing data: alignment={bool(alignment)}, scenes={len(scenes) if scenes else 0}")
-        return []
+
+def _get_audio_duration(audio_path: Path) -> float:
+    """Get audio duration using ffprobe."""
+    try:
+        probe_cmd = [
+            FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)
+        ]
+        result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True, timeout=10)
+        return float(result.stdout.strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get audio duration: {e}")
+
+
+async def _download_media(url: str, temp_path: Path, index: int, is_image: bool) -> Optional[Path]:
+    """Download a media file (video or image)."""
+    try:
+        # Handle local files (YouTube clips)
+        if url.startswith('/') or url.startswith('./'):
+            local_path = Path(url)
+            if local_path.exists():
+                ext = local_path.suffix or '.mp4'
+                dest_path = temp_path / f"media_{index}{ext}"
+                import shutil
+                shutil.copy(url, dest_path)
+                return dest_path
+            return None
+
+        # Download remote file with proper headers to avoid blocks
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        response = requests.get(url, timeout=60, stream=True, headers=headers)
+        if response.status_code != 200:
+            print(f"      Download failed: HTTP {response.status_code}")
+            return None
+
+        content_type = response.headers.get('content-type', '')
+        if is_image:
+            if 'png' in content_type or url.lower().endswith('.png'):
+                ext = '.png'
+            elif 'webp' in content_type or url.lower().endswith('.webp'):
+                ext = '.webp'
+            else:
+                ext = '.jpg'
+        else:
+            ext = '.mp4'
+
+        media_path = temp_path / f"media_{index}{ext}"
+        with open(media_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return media_path
+    except Exception as e:
+        print(f"      Download error: {e}")
+        return None
+
+
+def _process_media_segment(
+    input_path: Path,
+    output_path: Path,
+    duration: float,
+    is_image: bool
+) -> bool:
+    """Process a single media segment to the correct duration."""
+    try:
+        if is_image:
+            # Convert image to video with Ken Burns effect
+            fps = 30
+            # Use round() to get nearest frame count, add 1 to ensure we have enough frames
+            total_frames = round(duration * fps) + 1
+            zoom_per_frame = 0.12 / max(total_frames, 1)
+
+            zoompan_filter = (
+                f"scale=2160:3840:force_original_aspect_ratio=increase,"
+                f"crop=2160:3840,"
+                f"zoompan=z='min(1+{zoom_per_frame}*on,1.12)':"
+                f"x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':"
+                f"d={total_frames}:"
+                f"s=1080x1920:"
+                f"fps={fps}"
+            )
+
+            cmd = [
+                FFMPEG_EXECUTABLE, '-y',
+                '-i', str(input_path),
+                '-vf', zoompan_filter,
+                '-t', f'{duration:.3f}',  # Force exact output duration
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
+                '-pix_fmt', 'yuv420p',
+                '-an',
+                str(output_path)
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=120, text=True)
+                return True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # Fallback: simple image to video
+                simple_cmd = [
+                    FFMPEG_EXECUTABLE, '-y',
+                    '-loop', '1',
+                    '-i', str(input_path),
+                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                    '-c:v', 'h264_videotoolbox',
+                    '-b:v', '5000k',
+                    '-pix_fmt', 'yuv420p',
+                    '-t', f'{duration:.3f}',
+                    '-r', '30',
+                    '-an',
+                    str(output_path)
+                ]
+                subprocess.run(simple_cmd, check=True, capture_output=True, timeout=90, text=True)
+                return True
+        else:
+            # Trim video to duration
+            cmd = [
+                FFMPEG_EXECUTABLE, '-y',
+                '-i', str(input_path),
+                '-t', f'{duration:.3f}',
+                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
+                '-an',
+                str(output_path)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60, text=True)
+            return True
+    except Exception as e:
+        print(f"      Process error: {e}")
+        return False
+
+
+def _concatenate_segments(segment_paths: List[Path], output_path: Path) -> None:
+    """Concatenate multiple video segments."""
+    if len(segment_paths) == 1:
+        import shutil
+        shutil.copy(segment_paths[0], output_path)
+        return
+
+    # Build filter_complex for concatenation
+    cmd = [FFMPEG_EXECUTABLE, '-y']
+    for path in segment_paths:
+        cmd.extend(['-i', str(path)])
+
+    filter_parts = []
+    for i in range(len(segment_paths)):
+        filter_parts.append(f"[{i}:v]setsar=1[v{i}]")
+
+    concat_inputs = ''.join([f"[v{i}]" for i in range(len(segment_paths))])
+    filter_parts.append(f"{concat_inputs}concat=n={len(segment_paths)}:v=1:a=0[outv]")
+
+    cmd.extend([
+        '-filter_complex', ';'.join(filter_parts),
+        '-map', '[outv]',
+        '-c:v', 'h264_videotoolbox',
+        '-b:v', '5000k',
+        str(output_path)
+    ])
 
     try:
-        characters = alignment.get('characters', [])
-        start_times = alignment.get('character_start_times_seconds', [])
-        end_times = alignment.get('character_end_times_seconds', [])
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300, text=True)
+        print(f"✓ Concatenated {len(segment_paths)} segments")
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Concatenation failed: {e.stderr[:500] if e.stderr else 'Unknown error'}")
+        raise HTTPException(status_code=500, detail="Failed to concatenate video segments")
 
-        if not characters or not start_times or not end_times:
-            print("⚠ Alignment data incomplete, cannot calculate scene durations")
-            return []
 
-        print(f"📊 SCENE TIMING DEBUG:")
-        print(f"   Alignment: {len(characters)} chars, {len(start_times)} start_times, {len(end_times)} end_times")
-        print(f"   Scenes received: {len(scenes)}")
-        for s in scenes:
-            print(f"      Scene {s.get('scene_number')}: word_start={s.get('word_start')}, word_end={s.get('word_end')}")
+def _check_video_duration(video_path: Path, audio_duration: float) -> None:
+    """Check video duration and log warning if shorter than audio (but don't extend - replacement happens earlier)."""
+    try:
+        probe_cmd = [
+            FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        video_duration = float(result.stdout.strip())
 
-        # Build word boundaries from character data
-        word_boundaries: List[Dict[str, Any]] = []
-        current_word_index = 0
-        word_start_time: Optional[float] = None
-        word_end_time: Optional[float] = None
-        current_word = ""
-
-        for i, char in enumerate(characters):
-            if i >= len(start_times) or i >= len(end_times):
-                break
-
-            if char == ' ' or char == '\n':
-                # End of word
-                if word_start_time is not None and current_word.strip():
-                    word_boundaries.append({
-                        'word_index': current_word_index,
-                        'word': current_word.strip(),
-                        'start': word_start_time,
-                        'end': word_end_time
-                    })
-                    current_word_index += 1
-                word_start_time = None
-                word_end_time = None
-                current_word = ""
-            else:
-                # Part of a word
-                if word_start_time is None:
-                    word_start_time = start_times[i]
-                word_end_time = end_times[i]
-                current_word += char
-
-        # Don't forget the last word
-        if word_start_time is not None and current_word.strip():
-            word_boundaries.append({
-                'word_index': current_word_index,
-                'word': current_word.strip(),
-                'start': word_start_time,
-                'end': word_end_time
-            })
-
-        total_alignment_words = len(word_boundaries)
-        print(f"✓ Built {total_alignment_words} word boundaries from alignment")
-
-        # Print timing for first and last words
-        if word_boundaries:
-            print(f"   First word: '{word_boundaries[0]['word']}' at {word_boundaries[0]['start']:.3f}s")
-            print(f"   Last word: '{word_boundaries[-1]['word']}' ends at {word_boundaries[-1]['end']:.3f}s")
-
-        # Verify word count against script if provided
-        if script:
-            script_words = script.split()
-            script_word_count = len(script_words)
-            if script_word_count != total_alignment_words:
-                print(f"⚠ WORD COUNT MISMATCH: script has {script_word_count} words, alignment has {total_alignment_words} words")
-                print(f"   Script first 5 words: {script_words[:5]}")
-                print(f"   Alignment first 5 words: {[wb['word'] for wb in word_boundaries[:5]]}")
-            else:
-                print(f"✓ Word counts match: {script_word_count} words")
-
-        # Find max word_end from scenes to verify alignment coverage
-        max_scene_word_end = max((s.get('word_end', 0) or 0) for s in scenes)
-        if max_scene_word_end > total_alignment_words:
-            print(f"⚠ Scene word_end ({max_scene_word_end}) exceeds alignment word count ({total_alignment_words})")
-            print(f"   Will clamp word_end values to {total_alignment_words}")
-
-        # Create a map of word_index -> timing
-        word_timing_map = {wb['word_index']: wb for wb in word_boundaries}
-
-        # Calculate duration for each scene based on word boundaries
-        scene_durations: List[float] = []
-
-        print(f"\n📊 SCENE TIMING CALCULATION (audio duration: {audio_duration:.3f}s):")
-
-        # Sort scenes by scene_number to ensure correct order
-        sorted_scenes = sorted(scenes, key=lambda s: s.get('scene_number', 0))
-
-        for scene in sorted_scenes:
-            word_start = scene.get('word_start')
-            word_end = scene.get('word_end')
-
-            if word_start is None or word_end is None:
-                print(f"   Scene {scene.get('scene_number')}: SKIPPED (word_start={word_start}, word_end={word_end})")
-                continue
-
-            # Clamp word indices to valid range
-            orig_word_start, orig_word_end = word_start, word_end
-            word_start = max(0, min(word_start, total_alignment_words - 1))
-            word_end = max(word_start + 1, min(word_end, total_alignment_words))
-
-            if orig_word_start != word_start or orig_word_end != word_end:
-                print(f"   ⚠ Clamped words {orig_word_start}-{orig_word_end} to {word_start}-{word_end}")
-
-            # Get start time (from word_start)
-            if word_start in word_timing_map:
-                start_time = word_timing_map[word_start]['start']
-            elif word_start == 0:
-                start_time = 0.0
-            else:
-                # Estimate: use previous word's end time
-                prev_words = [w for w in word_boundaries if w['word_index'] < word_start]
-                start_time = prev_words[-1]['end'] if prev_words else 0.0
-                print(f"   ⚠ word_start {word_start} not in map, estimated start_time={start_time:.3f}s")
-
-            # Get end time (from word_end - 1, since word_end is exclusive)
-            end_word_index = word_end - 1
-            if end_word_index in word_timing_map:
-                end_time = word_timing_map[end_word_index]['end']
-            else:
-                # For the last scene, use audio duration as end time
-                end_time = audio_duration
-                print(f"   ⚠ end_word_index {end_word_index} not in map, using audio_duration={audio_duration:.3f}s")
-
-            duration = max(end_time - start_time, 0.5)  # Minimum 0.5 second per scene
-            scene_durations.append(duration)
-
-            # Get actual words for this scene
-            scene_words = [wb['word'] for wb in word_boundaries if word_start <= wb['word_index'] < word_end]
-            print(f"   Scene {scene.get('scene_number')}: words {word_start}-{word_end} ({len(scene_words)} words)")
-            print(f"      Time: {start_time:.3f}s - {end_time:.3f}s = {duration:.3f}s")
-            if scene_words:
-                print(f"      First words: {' '.join(scene_words[:3])}")
-                print(f"      Last words: {' '.join(scene_words[-3:])}")
-
-        total_scene_duration = sum(scene_durations)
-        diff = total_scene_duration - audio_duration
-        print(f"\n   Total scene duration: {total_scene_duration:.3f}s vs audio: {audio_duration:.3f}s (diff: {diff:.3f}s)")
-
-        # If total duration differs significantly from audio, adjust proportionally
-        if abs(diff) > 0.1 and scene_durations:
-            print(f"   ⚠ Adjusting durations to match audio...")
-            scale_factor = audio_duration / total_scene_duration
-            scene_durations = [d * scale_factor for d in scene_durations]
-            print(f"   Adjusted durations: {[f'{d:.2f}s' for d in scene_durations]}")
-
-        return scene_durations
-
+        if video_duration < audio_duration:
+            diff = audio_duration - video_duration
+            print(f"⚠ Video is {diff:.1f}s shorter than audio ({video_duration:.1f}s vs {audio_duration:.1f}s)")
+            print(f"   Note: Media replacement should have been handled during retrieval")
+        else:
+            print(f"✓ Video duration OK: {video_duration:.1f}s (audio: {audio_duration:.1f}s)")
     except Exception as e:
-        print(f"⚠ Error calculating scene durations: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+        print(f"⚠ Could not check video duration: {e}")
+
+
+def _generate_subtitles(request: CompileVideoRequest, temp_path: Path, audio_duration: float) -> Optional[Path]:
+    """Generate ASS subtitles."""
+    subtitle_path = None
+    script_text = request.script.strip()
+
+    if request.alignment and request.tts_provider == "elevenlabs":
+        try:
+            class AlignmentData:
+                def __init__(self, data):
+                    self.characters = data.get('characters', [])
+                    self.character_start_times_seconds = data.get('character_start_times_seconds', [])
+                    self.character_end_times_seconds = data.get('character_end_times_seconds', [])
+
+            alignment_obj = AlignmentData(request.alignment)
+            ass_content = create_ass_from_elevenlabs_alignment(script_text, alignment_obj, audio_duration)
+            subtitle_path = temp_path / "subtitles.ass"
+            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                f.write(ass_content)
+            print("✓ Created subtitles from ElevenLabs alignment")
+        except Exception as e:
+            print(f"⚠ ElevenLabs subtitles failed: {e}")
+
+    if subtitle_path is None and TTS_AVAILABLE and tts_client:
+        try:
+            selected_voice = request.voice_name or "en-US-Neural2-H"
+            _, timepoints = generate_tts_with_timing(script_text, voice_name=selected_voice)
+            if timepoints:
+                ass_content = create_ass_from_timepoints(script_text, timepoints, audio_duration, style="3words")
+                subtitle_path = temp_path / "subtitles.ass"
+                with open(subtitle_path, 'w', encoding='utf-8') as f:
+                    f.write(ass_content)
+                print("✓ Created subtitles from Google TTS")
+        except Exception as e:
+            print(f"⚠ Google TTS subtitles failed: {e}")
+
+    if subtitle_path is None:
+        try:
+            ass_content = create_ass_fallback(script_text, audio_duration)
+            subtitle_path = temp_path / "subtitles.ass"
+            with open(subtitle_path, 'w', encoding='utf-8') as f:
+                f.write(ass_content)
+            print("✓ Created fallback subtitles")
+        except Exception as e:
+            print(f"⚠ Fallback subtitles failed: {e}")
+
+    return subtitle_path
+
+
+def _finalize_video(
+    video_path: Path,
+    audio_path: Path,
+    subtitle_path: Optional[Path],
+    output_path: Path,
+    audio_duration: float
+) -> None:
+    """Combine video, audio, and subtitles into final output."""
+    if subtitle_path and subtitle_path.exists():
+        subtitle_escaped = str(subtitle_path).replace('\\', '/').replace(':', '\\:')
+        video_filter = f"ass='{subtitle_escaped}'"
+        cmd = [
+            FFMPEG_EXECUTABLE, '-y',
+            '-i', str(video_path),
+            '-i', str(audio_path),
+            '-vf', video_filter,
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', '5000k',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-t', f'{audio_duration:.3f}',
+            str(output_path)
+        ]
+    else:
+        cmd = [
+            FFMPEG_EXECUTABLE, '-y',
+            '-i', str(video_path),
+            '-i', str(audio_path),
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', '5000k',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-t', f'{audio_duration:.3f}',
+            str(output_path)
+        ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=180, text=True)
+        print("✓ Final video created")
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Final video failed: {e.stderr[:500] if e.stderr else 'Unknown error'}")
+        raise HTTPException(status_code=500, detail="Failed to create final video")
+
 
 async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
     """
-    Combine multiple stock videos with audio using ffmpeg.
-    Downloads videos, combines them, adds audio, burns captions, and returns the final video.
+    Combine media segments with audio using ffmpeg.
+
+    Processes video_urls (or images if use_images=True) and combines
+    them with audio and subtitles.
     """
+    # Validate inputs
     if not request.video_urls or len(request.video_urls) == 0:
-        raise HTTPException(status_code=400, detail="At least one video URL is required")
-    
+        raise HTTPException(status_code=400, detail="video_urls is required")
+
     if not request.audio_url:
         raise HTTPException(status_code=400, detail="Audio URL is required")
-    
+
     if not request.script or not request.script.strip():
         raise HTTPException(status_code=400, detail="Script text is required for captions")
     
@@ -239,13 +375,18 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         video_paths = []
         use_images = getattr(request, 'use_images', False)
 
+        # Headers to avoid blocks from image hosts
+        download_headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+
         if use_images:
             print(f"🖼️  Downloading {len(request.video_urls)} images...")
             for i, image_url in enumerate(request.video_urls):
                 try:
-                    response = requests.get(image_url, timeout=30, stream=True)
+                    response = requests.get(image_url, timeout=30, stream=True, headers=download_headers)
                     if response.status_code != 200:
-                        print(f"Warning: Failed to download image {i+1}: {image_url[:50]}...")
+                        print(f"Warning: Failed to download image {i+1} (HTTP {response.status_code}): {image_url[:50]}...")
                         continue
 
                     # Determine image format from content-type or URL
@@ -274,17 +415,31 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             print(f"📹 Downloading {len(request.video_urls)} videos...")
             for i, video_url in enumerate(request.video_urls):
                 try:
-                    video_response = requests.get(video_url, timeout=30, stream=True)
-                    if video_response.status_code != 200:
-                        print(f"Warning: Failed to download video {i+1}: {video_url[:50]}...")
-                        continue
-
                     video_path = temp_path / f"video_{i+1}.mp4"
-                    with open(video_path, 'wb') as f:
-                        for chunk in video_response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    video_paths.append(str(video_path))
-                    print(f"  ✓ Downloaded video {i+1}")
+
+                    # Check if this is a local file path (YouTube clips) or a URL
+                    if video_url.startswith('/') or video_url.startswith('./'):
+                        # Local file - copy it to temp directory
+                        import shutil
+                        if Path(video_url).exists():
+                            shutil.copy(video_url, video_path)
+                            video_paths.append(str(video_path))
+                            print(f"  ✓ Copied local video {i+1}")
+                        else:
+                            print(f"Warning: Local video file not found: {video_url}")
+                            continue
+                    else:
+                        # Remote URL - download it
+                        video_response = requests.get(video_url, timeout=30, stream=True, headers=download_headers)
+                        if video_response.status_code != 200:
+                            print(f"Warning: Failed to download video {i+1} (HTTP {video_response.status_code}): {video_url[:50]}...")
+                            continue
+
+                        with open(video_path, 'wb') as f:
+                            for chunk in video_response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        video_paths.append(str(video_path))
+                        print(f"  ✓ Downloaded video {i+1}")
                 except Exception as e:
                     print(f"Error downloading video {i+1}: {e}")
                     continue
@@ -329,39 +484,13 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         if audio_duration is None or audio_duration <= 0:
             raise HTTPException(status_code=500, detail="Invalid audio duration detected. Please check audio file.")
         
-        # Calculate scene durations - use provided durations, calculate from alignment, or equal split
+        # Calculate scene durations - use provided durations or equal split
         print(f"📹 Compiling video with {len(video_paths)} media files")
         print(f"🎵 Audio duration: {audio_duration:.2f}s")
 
         if request.scene_durations and len(request.scene_durations) == len(video_paths):
             scene_durations = request.scene_durations
             print(f"⏱️  Using provided scene durations: {[f'{d:.2f}s' for d in scene_durations]}")
-        elif request.alignment and request.scenes:
-            # Calculate scene durations from alignment and scene word boundaries
-            print(f"⏱️  Calculating scene durations from alignment...")
-            scenes_data = [
-                {
-                    'scene_number': s.scene_number,
-                    'word_start': s.word_start,
-                    'word_end': s.word_end
-                }
-                for s in request.scenes if s.word_start is not None
-            ]
-            calculated_durations = calculate_scene_durations_from_alignment(
-                request.alignment,
-                scenes_data,
-                audio_duration,
-                script=request.script
-            )
-            if calculated_durations and len(calculated_durations) == len(video_paths):
-                scene_durations = calculated_durations
-                print(f"⏱️  Calculated scene durations: {[f'{d:.2f}s' for d in scene_durations]}")
-            else:
-                # Fallback if calculation failed or count mismatch
-                print(f"⚠ Duration calculation mismatch: got {len(calculated_durations)}, need {len(video_paths)}")
-                equal_duration = audio_duration / len(video_paths)
-                scene_durations = [equal_duration] * len(video_paths)
-                print(f"⏱️  Using equal scene duration fallback: {equal_duration:.2f}s per video")
         else:
             equal_duration = audio_duration / len(video_paths)
             scene_durations = [equal_duration] * len(video_paths)
@@ -398,8 +527,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-vf', zoompan_filter,
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
+                    '-c:v', 'h264_videotoolbox',
+                    '-b:v', '5000k',
                     '-pix_fmt', 'yuv420p',
                     '-an',
                     str(trimmed_path)
@@ -419,8 +548,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                         '-loop', '1',
                         '-i', str(media_path),
                         '-vf', f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                        '-c:v', 'libx264',
-                        '-preset', 'fast',
+                        '-c:v', 'h264_videotoolbox',
+                        '-b:v', '5000k',
                         '-pix_fmt', 'yuv420p',
                         '-t', f'{scene_duration:.3f}',
                         '-r', str(fps),
@@ -441,8 +570,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-t', f'{scene_duration:.3f}',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
+                    '-c:v', 'h264_videotoolbox',
+                    '-b:v', '5000k',
                     '-an',
                     str(trimmed_path)
                 ]
@@ -466,8 +595,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(trimmed_videos[0]),
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                '-c:v', 'libx264',
-                '-preset', 'fast',
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
                 '-an',
                 str(concat_video_path)
             ]
@@ -502,8 +631,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             concat_cmd.extend([
                 '-filter_complex', filter_complex,
                 '-map', '[outv]',
-                '-c:v', 'libx264',
-                '-preset', 'fast',
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
                 str(concat_video_path)
             ])
             
@@ -572,7 +701,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 print(f"⚠ Failed to create fallback subtitles: {e}")
                 subtitle_path = None
         
-        # Step 2.5: Verify concatenated video duration and extend if needed
+        # Step 2.5: Verify concatenated video duration (don't extend - just log)
         try:
             probe_concat_cmd = [
                 FFPROBE_EXECUTABLE, '-v', 'error', '-show_entries', 'format=duration',
@@ -581,26 +710,10 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             probe_result = subprocess.run(probe_concat_cmd, capture_output=True, text=True, timeout=10)
             concat_duration = float(probe_result.stdout.strip())
             print(f"📊 Concatenated video duration: {concat_duration:.2f}s (audio: {audio_duration:.2f}s)")
-            
-            # If concatenated video is shorter than audio, extend it by looping the last frame
+
             if concat_duration < audio_duration:
-                extended_path = temp_path / "extended_concat.mp4"
-                extend_duration = audio_duration - concat_duration
-                extend_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-i', str(concat_video_path),
-                    '-vf', f'tpad=stop_mode=clone:stop_duration={extend_duration:.3f}',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-an',
-                    str(extended_path)
-                ]
-                try:
-                    subprocess.run(extend_cmd, check=True, capture_output=True, timeout=30, text=True)
-                    concat_video_path = extended_path
-                    print(f"✓ Extended video to match audio duration ({audio_duration:.2f}s)")
-                except Exception as e:
-                    print(f"⚠ Warning: Could not extend video: {e}")
+                diff = audio_duration - concat_duration
+                print(f"⚠ Video is {diff:.1f}s shorter than audio - media replacement should have happened during retrieval")
         except Exception as e:
             print(f"⚠ Warning: Could not verify concatenated video duration: {e}")
         
@@ -615,8 +728,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
                 '-vf', video_filter,
-                '-c:v', 'libx264',
-                '-preset', 'fast',
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
                 '-map', '0:v:0',
@@ -631,8 +744,8 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(concat_video_path),
                 '-i', str(audio_path),
-                '-c:v', 'libx264',
-                '-preset', 'fast',
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '5000k',
                 '-c:a', 'aac',
                 '-b:a', '192k',
                 '-map', '0:v:0',
@@ -657,3 +770,128 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         video_data_url = f"data:video/mp4;base64,{video_base64}"
         
         return CompileVideoResponse(video_url=video_data_url)
+
+
+async def compile_video_from_clauses(
+    segments: List[Dict[str, Any]],
+    audio_data: Dict[str, Any],
+    script: str,
+    alignment: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Compile video from clause-based media segments.
+
+    Args:
+        segments: List of segment dicts with:
+            - clause_id: int
+            - media_url: str (URL or local path)
+            - media_type: str (ai_video, stock_video, youtube_video, web_image, ai_image)
+            - start_time: float
+            - duration: float
+            - text: str (clause text)
+        audio_data: Dict with audio_url, audio_content, alignment
+        script: Full script text
+        alignment: Word-level timing from TTS
+
+    Returns:
+        Base64 data URL of the compiled video
+    """
+    print(f"\n🎬 Compiling video from {len(segments)} clause segments")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+
+        # Save audio to file
+        if "audio_content" in audio_data and audio_data["audio_content"]:
+            audio_path = temp_path / "audio.mp3"
+            with open(audio_path, 'wb') as f:
+                f.write(audio_data["audio_content"])
+        elif audio_data["audio_url"].startswith('data:audio'):
+            audio_base64 = audio_data["audio_url"].split(',')[1]
+            audio_bytes = base64.b64decode(audio_base64)
+            audio_ext = "mp3" if "mp3" in audio_data["audio_url"] else "wav"
+            audio_path = temp_path / f"audio.{audio_ext}"
+            with open(audio_path, 'wb') as f:
+                f.write(audio_bytes)
+        else:
+            audio_path = await _download_audio(audio_data["audio_url"], temp_path)
+
+        audio_duration = _get_audio_duration(audio_path)
+        print(f"   Audio duration: {audio_duration:.2f}s")
+
+        # Download and process each segment
+        processed_paths: List[Path] = []
+
+        for i, seg in enumerate(segments):
+            print(f"   [{i+1}/{len(segments)}] Processing {seg['media_type']}: {seg['duration']:.2f}s")
+
+            media_url = seg["media_url"]
+            is_image = seg["media_type"] in ("ai_image", "web_image")
+            duration = seg["duration"]
+            output_path = temp_path / f"segment_{i:03d}.mp4"
+
+            # Get media (local path or download remote)
+            media_path = None
+            if media_url.startswith(('http://', 'https://')):
+                media_path = await _download_media(media_url, temp_path, i, is_image)
+            elif os.path.exists(media_url):
+                media_path = Path(media_url)
+
+            if not media_path or not media_path.exists():
+                print(f"      ✗ Failed to get media for clause {seg['clause_id']}")
+                continue
+
+            # Process to exact duration
+            success = _process_media_segment(media_path, output_path, duration, is_image)
+
+            if success and output_path.exists():
+                processed_paths.append(output_path)
+                print(f"      ✓ Segment {i+1} ready ({duration:.2f}s)")
+            else:
+                print(f"      ✗ Failed to process segment {i+1}")
+
+        if not processed_paths:
+            raise HTTPException(status_code=500, detail="No media segments processed successfully")
+
+        print(f"\n   Concatenating {len(processed_paths)} segments...")
+
+        # Concatenate all segments
+        concat_path = temp_path / "concatenated.mp4"
+        _concatenate_segments(processed_paths, concat_path)
+
+        # Check video duration (just log, don't extend - replacement happens during media retrieval)
+        _check_video_duration(concat_path, audio_duration)
+        final_video_path = concat_path
+
+        # Generate subtitles using the subtitles module
+        subtitle_path = None
+        if alignment:
+            from subtitles import create_ass_from_elevenlabs_alignment
+            subtitle_path = temp_path / "subtitles.ass"
+            try:
+                ass_content = create_ass_from_elevenlabs_alignment(
+                    script=script,
+                    alignment=alignment,
+                    audio_duration=audio_duration
+                )
+                with open(subtitle_path, 'w') as f:
+                    f.write(ass_content)
+                print(f"   ✓ Generated subtitles")
+            except Exception as e:
+                print(f"   ⚠ Subtitle generation failed: {e}")
+                subtitle_path = None
+
+        # Combine video + audio + subtitles
+        output_path = temp_path / "final_video.mp4"
+        _finalize_video(final_video_path, audio_path, subtitle_path, output_path, audio_duration)
+
+        # Return as base64 data URL
+        with open(output_path, 'rb') as f:
+            video_bytes = f.read()
+
+        video_base64 = base64.b64encode(video_bytes).decode('utf-8')
+        video_data_url = f"data:video/mp4;base64,{video_base64}"
+
+        print(f"\n✅ Video compilation complete ({len(video_bytes) / (1024*1024):.1f} MB)")
+
+        return video_data_url

@@ -7,8 +7,8 @@ import os
 import json
 import asyncio
 import requests
-from typing import Dict, Any, List
-from config import openai_client
+from typing import Dict, Any, List, Optional
+from config import xai_client, XAI_MODEL
 
 
 # Check if Fal.ai is configured
@@ -49,7 +49,7 @@ def generate_structured_image_prompt(
     section_name: str = "HOOK"
 ) -> Dict[str, Any]:
     """
-    Use OpenAI to generate a detailed JSON-structured image prompt for a single scene.
+    Use xAI to generate a detailed JSON-structured image prompt for a single scene.
 
     Args:
         topic: The overall video topic
@@ -60,7 +60,7 @@ def generate_structured_image_prompt(
     Returns:
         Structured JSON prompt dict for image generation
     """
-    if not openai_client:
+    if not xai_client:
         return {
             "scene": f"A visually striking scene about {topic}",
             "subjects": [{"type": "main subject", "description": topic, "position": "center"}],
@@ -110,8 +110,8 @@ Return ONLY valid JSON in this exact structure:
 
 Make the scene dramatic and visually compelling. Be specific with colors and details."""
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = xai_client.chat.completions.create(
+            model=XAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=800,
             temperature=0.7
@@ -401,12 +401,13 @@ def call_fal_model(
         }
 
 
-async def generate_image_with_fallback(
+def generate_image_with_fallback_sync(
     scene_prompt: Dict[str, Any],
     scene_idx: int
 ) -> Dict[str, Any]:
     """
     Generate an image for a single scene using primary model, with fallbacks if it fails.
+    This is a synchronous function meant to be run in a thread pool.
 
     Args:
         scene_prompt: Dict with 'section_name', 'text_prompt', 'structured_prompt'
@@ -461,6 +462,7 @@ async def generate_images_for_all_scenes(
 ) -> List[Dict[str, Any]]:
     """
     Generate images for all scenes using primary model (Nano Banana Pro) with fallbacks.
+    Runs all API calls in parallel using a thread pool.
 
     Args:
         scene_prompts: List of dicts with 'section_name', 'text_prompt', 'structured_prompt'
@@ -468,38 +470,33 @@ async def generate_images_for_all_scenes(
     Returns:
         List of image results (one per scene)
     """
-    print(f"\n   🎨 Generating {len(scene_prompts)} images (primary: {PRIMARY_MODEL['name']})...")
+    print(f"\n   🎨 Generating {len(scene_prompts)} images in parallel (primary: {PRIMARY_MODEL['name']})...")
 
-    # Generate images for all scenes in parallel
+    # Run all API calls in parallel using thread pool (since requests is synchronous)
     loop = asyncio.get_event_loop()
     tasks = [
         loop.run_in_executor(
             None,
-            lambda idx=i, prompt=scene_prompt: asyncio.run(
-                generate_image_with_fallback(prompt, idx)
-            )
+            generate_image_with_fallback_sync,
+            scene_prompt,
+            scene_idx
         )
-        for i, scene_prompt in enumerate(scene_prompts)
+        for scene_idx, scene_prompt in enumerate(scene_prompts)
     ]
 
-    # Actually, run_in_executor doesn't work well with async functions
-    # Let's use a simpler synchronous approach
-    results = []
-    for scene_idx, scene_prompt in enumerate(scene_prompts):
-        result = await generate_image_with_fallback(scene_prompt, scene_idx)
-        results.append(result)
+    results = await asyncio.gather(*tasks)
 
     successful = sum(1 for r in results if r.get("url"))
     print(f"\n   ✅ Generated {successful}/{len(scene_prompts)} images successfully")
 
-    return results
+    return list(results)
 
 
 async def generate_image_for_video(
     topic: str,
     script: str,
     first_section_text: str,
-    sections: List[Dict[str, Any]] = None
+    sections: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Main entry point: Generate AI images for each scene using Nano Banana Pro (with fallbacks).
@@ -537,3 +534,59 @@ async def generate_image_for_video(
             for p in scene_prompts
         ]
     }
+
+
+async def generate_single_image(
+    prompt: str,
+    topic: str,
+    aspect_ratio: str = "9:16"
+) -> Optional[Dict[str, Any]]:
+    """
+    Generate a single AI image from a prompt.
+    Used by the media router for individual clause visuals.
+
+    Args:
+        prompt: The image generation prompt/query
+        topic: The overall video topic (for context)
+        aspect_ratio: Aspect ratio for the image (default 9:16 for vertical)
+
+    Returns:
+        Dict with 'url', 'width', 'height' or None if failed
+    """
+    print(f"   🎨 Generating AI image: \"{prompt[:50]}...\"")
+
+    # Generate a structured prompt for better results
+    structured = generate_structured_image_prompt(topic, prompt, prompt)
+    text_prompt = structured_prompt_to_text(structured)
+
+    # Try primary model
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        call_fal_model,
+        PRIMARY_MODEL,
+        text_prompt,
+        aspect_ratio,
+        1,
+        "single"
+    )
+
+    if result.get("url"):
+        return result
+
+    # Try fallbacks
+    for fallback_model in FALLBACK_MODELS:
+        result = await loop.run_in_executor(
+            None,
+            call_fal_model,
+            fallback_model,
+            text_prompt,
+            aspect_ratio,
+            1,
+            "single"
+        )
+        if result.get("url"):
+            return result
+
+    print(f"   ⚠ All models failed for image generation")
+    return None

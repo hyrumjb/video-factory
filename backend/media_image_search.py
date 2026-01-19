@@ -6,7 +6,7 @@ Optimized for finding images for TikTok-style video backgrounds.
 import os
 import requests
 from typing import List, Dict, Any
-from config import openai_client
+from config import xai_client, XAI_MODEL
 
 
 def search_google_images(
@@ -87,7 +87,7 @@ def generate_image_search_queries(
     Returns:
         List of search queries, one per scene (in order)
     """
-    if not openai_client:
+    if not xai_client:
         return [scene.get('description', '')[:50] for scene in scenes]
 
     try:
@@ -125,8 +125,8 @@ EXAMPLE for topic "Spain basketball team":
 
 Return ONLY the queries, one per line, in scene order. Every query must be relevant to "{topic}"."""
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = xai_client.chat.completions.create(
+            model=XAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.7

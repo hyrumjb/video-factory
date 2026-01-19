@@ -157,9 +157,15 @@ def convert_elevenlabs_alignment_to_word_timings(text: str, alignment) -> list:
         return []
 
     try:
-        characters = alignment.characters if hasattr(alignment, 'characters') else []
-        start_times = alignment.character_start_times_seconds if hasattr(alignment, 'character_start_times_seconds') else []
-        end_times = alignment.character_end_times_seconds if hasattr(alignment, 'character_end_times_seconds') else []
+        # Handle both dict and object formats
+        if isinstance(alignment, dict):
+            characters = alignment.get('characters', [])
+            start_times = alignment.get('character_start_times_seconds', [])
+            end_times = alignment.get('character_end_times_seconds', [])
+        else:
+            characters = alignment.characters if hasattr(alignment, 'characters') else []
+            start_times = alignment.character_start_times_seconds if hasattr(alignment, 'character_start_times_seconds') else []
+            end_times = alignment.character_end_times_seconds if hasattr(alignment, 'character_end_times_seconds') else []
 
         if not characters or not start_times or not end_times:
             print(f"⚠ ElevenLabs alignment missing data: chars={len(characters)}, starts={len(start_times)}, ends={len(end_times)}")

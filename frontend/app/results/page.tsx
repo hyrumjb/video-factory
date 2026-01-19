@@ -3,6 +3,8 @@
 import { useRouter } from 'next/navigation';
 import { Suspense, useEffect, useState, useRef } from 'react';
 import Link from 'next/link';
+import { useAuth } from '@/contexts/AuthContext';
+import { logOut } from '@/lib/firebase';
 
 type StepStatus = 'pending' | 'running' | 'done' | 'error' | 'retrying';
 
@@ -20,212 +22,239 @@ interface ProgressEvent {
   data?: any;
 }
 
-interface Section {
-  name: string;
+interface Clause {
+  clause_id: number;
   text: string;
-  word_start: number;
-  word_end: number;
+  idea_type: string;
+  start_time: number;
+  next_start_time: number;
 }
 
-function StatusIcon({ status }: { status: StepStatus }) {
-  switch (status) {
-    case 'pending':
-      return <span className="w-5 h-5 rounded-full border-2 border-gray-300" />;
-    case 'running':
-      return (
-        <span className="w-5 h-5 rounded-full border-2 border-foreground border-t-transparent animate-spin" />
-      );
-    case 'done':
-      return (
-        <span className="w-5 h-5 rounded-full bg-green-500 flex items-center justify-center text-white text-xs">
-          ✓
-        </span>
-      );
-    case 'error':
-      return (
-        <span className="w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-white text-xs">
-          ✕
-        </span>
-      );
-    case 'retrying':
-      return (
-        <span className="w-5 h-5 rounded-full border-2 border-yellow-500 border-t-transparent animate-spin" />
-      );
-    default:
-      return null;
-  }
+interface MediaItem {
+  clause_id: number;
+  media_type: string;
+  media_url: string | null;
+  duration: number;
+  error?: string;
 }
 
-function ProgressStep({ label, state }: { label: string; state: StepState }) {
-  return (
-    <div className="flex items-center gap-3 py-2">
-      <StatusIcon status={state.status} />
-      <div className="flex-1">
-        <p className="text-sm font-medium">{label}</p>
-        {state.message && (
-          <p className="text-xs text-gray-500">{state.message}</p>
-        )}
-      </div>
-    </div>
-  );
-}
+type TabType = 'script' | 'audio' | 'clauses' | 'media';
+
+const STEPS = [
+  { id: 'script', label: 'Script' },
+  { id: 'tts', label: 'Audio' },
+  { id: 'clauses', label: 'Clauses' },
+  { id: 'routing', label: 'Planning' },
+  { id: 'media', label: 'Media' },
+  { id: 'compile', label: 'Compile' },
+];
 
 function ResultsContent() {
   const router = useRouter();
+  const { user } = useAuth();
   const [error, setError] = useState<string | null>(null);
-  const [isScrolled, setIsScrolled] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const topicRef = useRef<string | null>(null);
   const voiceIdRef = useRef<string>('nPczCjzI2devNBz1zQrb');
-  const bgTypeRef = useRef<'videos' | 'images' | 'ai'>('videos');
-  const [backgroundType, setBackgroundType] = useState<'videos' | 'images' | 'ai'>('videos');
+  const inputModeRef = useRef<'idea' | 'script'>('idea');
+  const helpRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const handleScroll = () => {
-      setIsScrolled(window.scrollY > 10);
-    };
-    window.addEventListener('scroll', handleScroll);
-    return () => window.removeEventListener('scroll', handleScroll);
-  }, []);
+  const handleLogout = async () => {
+    try {
+      await logOut();
+      router.push('/');
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
+  };
 
+  // Active tab for middle section
+  const [activeTab, setActiveTab] = useState<TabType>('script');
+
+  // Step states
   const [scriptStep, setScriptStep] = useState<StepState>({ status: 'pending' });
   const [ttsStep, setTtsStep] = useState<StepState>({ status: 'pending' });
-  const [videosStep, setVideosStep] = useState<StepState>({ status: 'pending' });
+  const [clausesStep, setClausesStep] = useState<StepState>({ status: 'pending' });
+  const [routingStep, setRoutingStep] = useState<StepState>({ status: 'pending' });
+  const [mediaStep, setMediaStep] = useState<StepState>({ status: 'pending' });
   const [compileStep, setCompileStep] = useState<StepState>({ status: 'pending' });
 
+  // Data from each step
   const [script, setScript] = useState<string | null>(null);
-  const [sections, setSections] = useState<Section[]>([]);
-  const [scenes, setScenes] = useState<any[]>([]);
-  const [videos, setVideos] = useState<any[]>([]);
-  const [aiImages, setAiImages] = useState<any[]>([]);
-  const [aiPrompt, setAiPrompt] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState<string>('elevenlabs');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [alignment, setAlignment] = useState<any>(null);
+  const [clauses, setClauses] = useState<Clause[]>([]);
+  const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [totalDuration, setTotalDuration] = useState<number>(0);
 
-  const [isPaused, setIsPaused] = useState(false);
-  const [pausedData, setPausedData] = useState<any>(null);
-  const [isGeneratingTts, setIsGeneratingTts] = useState(false);
-  const [isCompiling, setIsCompiling] = useState(false);
+  // Handle click outside for help popup
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (helpRef.current && !helpRef.current.contains(event.target as Node)) {
+        setIsHelpOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
-  // On-demand media generation states
-  const [isGeneratingVideos, setIsGeneratingVideos] = useState(false);
-  const [isGeneratingImages, setIsGeneratingImages] = useState(false);
-  const [isGeneratingAI, setIsGeneratingAI] = useState(false);
-  const [topic, setTopic] = useState<string | null>(null);
+  const stepStates: Record<string, StepState> = {
+    script: scriptStep,
+    tts: ttsStep,
+    clauses: clausesStep,
+    routing: routingStep,
+    media: mediaStep,
+    compile: compileStep,
+  };
 
   useEffect(() => {
-    window.scrollTo(0, 0);
-
     if (typeof window === 'undefined') return;
 
     const pendingTopic = sessionStorage.getItem('pendingTopic');
 
     if (pendingTopic) {
       const voiceId = sessionStorage.getItem('selectedVoice') || 'nPczCjzI2devNBz1zQrb';
-      const bgType = (sessionStorage.getItem('backgroundType') as 'videos' | 'images' | 'ai') || 'videos';
-
+      const inputMode = sessionStorage.getItem('inputMode') as 'idea' | 'script' || 'idea';
       topicRef.current = pendingTopic;
       voiceIdRef.current = voiceId;
-      bgTypeRef.current = bgType;
-      setBackgroundType(bgType);
-      setTopic(pendingTopic);
-
+      inputModeRef.current = inputMode;
       sessionStorage.removeItem('pendingTopic');
       sessionStorage.removeItem('selectedVoice');
-      sessionStorage.removeItem('backgroundType');
+      sessionStorage.removeItem('inputMode');
     }
 
     if (eventSourceRef.current && eventSourceRef.current.readyState !== EventSource.CLOSED) {
       return;
     }
 
-    const topic = topicRef.current;
+    const currentTopic = topicRef.current;
     const voiceId = voiceIdRef.current;
-    const bgTypeLocal = bgTypeRef.current;
+    const inputMode = inputModeRef.current;
 
-    if (!topic) {
+    if (!currentTopic) {
       router.push('/');
       return;
     }
 
-    const eventSource = new EventSource(
-      `http://localhost:8000/api/create-video?topic=${encodeURIComponent(topic.trim())}&voice_id=${encodeURIComponent(voiceId)}&staged=true&background_type=${encodeURIComponent(bgTypeLocal)}`
-    );
+    const existingJobId = sessionStorage.getItem('currentJobId');
+    let url = `http://localhost:8000/api/create-video?topic=${encodeURIComponent(currentTopic.trim())}&voice_id=${encodeURIComponent(voiceId)}&input_mode=${encodeURIComponent(inputMode)}`;
+    if (existingJobId) {
+      url += `&job_id=${encodeURIComponent(existingJobId)}`;
+    }
+
+    const eventSource = new EventSource(url);
     eventSourceRef.current = eventSource;
 
-    eventSource.onmessage = (event) => {
+    const handleEvent = (event: MessageEvent, stepName: string) => {
       try {
         const data: ProgressEvent = JSON.parse(event.data);
-
         const stepState: StepState = {
           status: data.status,
           message: data.message,
           progress: data.progress,
         };
-
-        switch (data.step) {
-          case 'script':
-            setScriptStep(stepState);
-            if (data.status === 'done' && data.data) {
-              setScript(data.data.script);
-              setScenes(data.data.scenes || []);
-              setSections(data.data.sections || []);
-            }
-            break;
-
-          case 'videos':
-            setVideosStep(stepState);
-            if (data.status === 'done' && data.data?.videos) {
-              setVideos(data.data.videos);
-            }
-            if (data.status === 'done' && data.data?.ai_images) {
-              setAiImages(data.data.ai_images);
-              setAiPrompt(data.data.ai_prompt || null);
-            }
-            break;
-
-          case 'paused':
-            setIsPaused(true);
-            setPausedData(data.data);
-            if (data.data?.ai_images) {
-              setAiImages(data.data.ai_images);
-              setAiPrompt(data.data.ai_prompt || null);
-            }
-            eventSource.close();
-            break;
-
-          case 'tts':
-            setTtsStep(stepState);
-            if (data.status === 'done' && data.data?.provider) {
-              setTtsProvider(data.data.provider);
-            }
-            break;
-
-          case 'compile':
-            setCompileStep(stepState);
-            break;
-
-          case 'complete':
-            if (data.data?.video_url) {
-              setVideoUrl(data.data.video_url);
-            }
-            eventSource.close();
-            break;
-
-          case 'error':
-            setError(data.message || 'An error occurred');
-            eventSource.close();
-            break;
-        }
+        return { data, stepState };
       } catch (err) {
-        console.error('Error parsing SSE event:', err);
+        console.error(`Error parsing ${stepName} event:`, err);
+        return null;
       }
     };
 
+    eventSource.addEventListener('job', (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data);
+        sessionStorage.setItem('currentJobId', data.job_id);
+      } catch (err) {
+        console.error('Error parsing job event:', err);
+      }
+    });
+
+    eventSource.addEventListener('script', (event: MessageEvent) => {
+      const result = handleEvent(event, 'script');
+      if (!result) return;
+      const { data, stepState } = result;
+      setScriptStep(stepState);
+      if (data.status === 'done' && data.data) {
+        setScript(data.data.script);
+      }
+    });
+
+    eventSource.addEventListener('tts', (event: MessageEvent) => {
+      const result = handleEvent(event, 'tts');
+      if (!result) return;
+      const { data, stepState } = result;
+      setTtsStep(stepState);
+      if (data.status === 'done' && data.data) {
+        if (data.data.provider) setTtsProvider(data.data.provider);
+        if (data.data.audio_url) setAudioUrl(data.data.audio_url);
+        setActiveTab('audio');
+      }
+    });
+
+    eventSource.addEventListener('clauses', (event: MessageEvent) => {
+      const result = handleEvent(event, 'clauses');
+      if (!result) return;
+      const { data, stepState } = result;
+      setClausesStep(stepState);
+      if (data.status === 'done' && data.data) {
+        setClauses(data.data.clauses || []);
+        if (data.data.total_duration) setTotalDuration(data.data.total_duration);
+        setActiveTab('clauses');
+      }
+    });
+
+    eventSource.addEventListener('routing', (event: MessageEvent) => {
+      const result = handleEvent(event, 'routing');
+      if (!result) return;
+      const { stepState } = result;
+      setRoutingStep(stepState);
+    });
+
+    eventSource.addEventListener('media', (event: MessageEvent) => {
+      const result = handleEvent(event, 'media');
+      if (!result) return;
+      const { data, stepState } = result;
+      setMediaStep(stepState);
+      if (data.status === 'done' && data.data) {
+        setMediaItems(data.data.media || []);
+        setActiveTab('media');
+      }
+    });
+
+    eventSource.addEventListener('compile', (event: MessageEvent) => {
+      const result = handleEvent(event, 'compile');
+      if (!result) return;
+      const { data, stepState } = result;
+      setCompileStep(stepState);
+      if (data.status === 'done' && data.data?.video_url) {
+        setVideoUrl(data.data.video_url);
+      }
+    });
+
+    eventSource.addEventListener('complete', (event: MessageEvent) => {
+      const result = handleEvent(event, 'complete');
+      if (!result) return;
+      const { data } = result;
+      if (data.data?.video_url) setVideoUrl(data.data.video_url);
+      if (data.data?.total_duration) setTotalDuration(data.data.total_duration);
+      setCompileStep({ status: 'done', message: 'Complete!' });
+      sessionStorage.removeItem('currentJobId');
+      eventSource.close();
+    });
+
+    eventSource.addEventListener('error', (event: MessageEvent) => {
+      if (event.data) {
+        const result = handleEvent(event, 'error');
+        if (result) setError(result.data.message || 'An error occurred');
+      }
+      sessionStorage.removeItem('currentJobId');
+      eventSource.close();
+    });
+
     eventSource.onerror = () => {
-      setError('Connection lost. Please try again.');
+      setError('Connection lost. Refresh to reconnect.');
       eventSource.close();
     };
 
@@ -236,657 +265,376 @@ function ResultsContent() {
     };
   }, [router]);
 
-  const handleGenerateTts = async () => {
-    if (!script || isGeneratingTts) return;
-
-    setIsGeneratingTts(true);
-    setTtsStep({ status: 'running', message: 'Generating audio...' });
-
-    try {
-      const response = await fetch('http://localhost:8000/api/generate-tts-elevenlabs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: script,
-          voice_id: voiceIdRef.current,
-        }),
-      });
-
-      if (!response.ok) throw new Error('TTS generation failed');
-
-      const data = await response.json();
-      setAudioUrl(data.audio_url);
-      setAlignment(data.alignment);
-      setTtsProvider('elevenlabs');
-      setTtsStep({ status: 'done', message: 'Audio generated (ElevenLabs)' });
-    } catch (err: any) {
-      setTtsStep({ status: 'error', message: err.message });
-    } finally {
-      setIsGeneratingTts(false);
-    }
-  };
-
-  const handleCompileVideo = async () => {
-    if (!audioUrl || isCompiling) return;
-    if (backgroundType === 'ai' && !aiImages.some(img => img.url)) return;
-    if (backgroundType !== 'ai' && !videos.length) return;
-
-    setIsCompiling(true);
-    const useImages = backgroundType === 'images' || backgroundType === 'ai';
-    const typeLabel = backgroundType === 'ai' ? 'AI image' : backgroundType === 'images' ? 'images' : 'videos';
-    setCompileStep({ status: 'running', message: `Compiling with ${typeLabel}...` });
-
-    try {
-      let mediaUrls: string[];
-      if (backgroundType === 'ai') {
-        // Map each scene to its corresponding AI image by scene_number
-        mediaUrls = [];
-        for (let i = 0; i < scenes.length; i++) {
-          const sceneNumber = scenes[i].scene_number;
-          // Find AI image for this scene (by scene_number or by index)
-          const matchingImage = aiImages.find(img => img.scene_number === sceneNumber) ||
-                                aiImages[i];
-          if (matchingImage?.url) {
-            mediaUrls.push(matchingImage.url);
-          } else {
-            // Use first available image as fallback
-            const fallback = aiImages.find(img => img.url);
-            if (fallback?.url) {
-              mediaUrls.push(fallback.url);
-            }
-          }
-        }
-        if (mediaUrls.length === 0) {
-          throw new Error('No AI images available');
-        }
-      } else if (backgroundType === 'images') {
-        mediaUrls = videos
-          .filter(v => v.images && v.images.length > 0)
-          .map(v => v.images[0].url);
-      } else {
-        mediaUrls = videos.filter(v => v.video_url).map(v => v.video_url);
-      }
-
-      const sceneTimings = scenes
-        .filter(s => s.word_start !== undefined)
-        .map(s => ({
-          scene_number: s.scene_number,
-          word_start: s.word_start,
-          word_end: s.word_end,
-        }));
-
-      const response = await fetch('http://localhost:8000/api/compile-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_urls: mediaUrls,
-          audio_url: audioUrl,
-          script: script,
-          alignment: alignment,
-          tts_provider: ttsProvider,
-          scenes: sceneTimings,
-          use_images: useImages,
-        }),
-      });
-
-      if (!response.ok) throw new Error('Video compilation failed');
-
-      const data = await response.json();
-      setVideoUrl(data.video_url);
-      setCompileStep({ status: 'done', message: 'Video compiled!' });
-    } catch (err: any) {
-      setCompileStep({ status: 'error', message: err.message });
-    } finally {
-      setIsCompiling(false);
-    }
-  };
-
-  const handleGenerateVideos = async () => {
-    if (!script || !topic || isGeneratingVideos) return;
-
-    setIsGeneratingVideos(true);
-
-    try {
-      const scenesPayload = scenes.map((s: any) => ({
-        scene_number: s.scene_number,
-        section_name: s.section_name,
-        description: s.description,
-        search_query: s.search_query,
-      }));
-
-      const response = await fetch('http://localhost:8000/api/search-stock-videos', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic,
-          script,
-          scenes: scenesPayload,
-        }),
-      });
-
-      if (!response.ok) throw new Error('Video search failed');
-
-      const data = await response.json();
-
-      // Merge video results into existing videos state
-      setVideos((prev) => {
-        const updated = [...prev];
-        for (const result of data.results) {
-          const idx = updated.findIndex((v) => v.scene_number === result.scene_number);
-          if (idx >= 0) {
-            updated[idx] = {
-              ...updated[idx],
-              video_url: result.video_url,
-              video_source: result.video_source,
-              video_search_query: result.video_search_query,
-            };
-          } else {
-            updated.push(result);
-          }
-        }
-        return updated;
-      });
-    } catch (err: any) {
-      console.error('Video generation error:', err);
-    } finally {
-      setIsGeneratingVideos(false);
-    }
-  };
-
-  const handleGenerateImages = async () => {
-    if (!script || !topic || isGeneratingImages) return;
-
-    setIsGeneratingImages(true);
-
-    try {
-      const scenesPayload = scenes.map((s: any) => ({
-        scene_number: s.scene_number,
-        section_name: s.section_name,
-        description: s.description,
-        search_query: s.search_query,
-      }));
-
-      const response = await fetch('http://localhost:8000/api/search-stock-images', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic,
-          script,
-          scenes: scenesPayload,
-        }),
-      });
-
-      if (!response.ok) throw new Error('Image search failed');
-
-      const data = await response.json();
-
-      // Merge image results into existing videos state
-      setVideos((prev) => {
-        const updated = [...prev];
-        for (const result of data.results) {
-          const idx = updated.findIndex((v) => v.scene_number === result.scene_number);
-          if (idx >= 0) {
-            updated[idx] = {
-              ...updated[idx],
-              images: result.images,
-              image_search_query: result.image_search_query,
-            };
-          } else {
-            updated.push(result);
-          }
-        }
-        return updated;
-      });
-    } catch (err: any) {
-      console.error('Image generation error:', err);
-    } finally {
-      setIsGeneratingImages(false);
-    }
-  };
-
-  const handleGenerateAI = async () => {
-    if (!script || !topic || isGeneratingAI) return;
-
-    setIsGeneratingAI(true);
-
-    try {
-      // Get first section text
-      const firstSectionText = sections.length > 0
-        ? sections[0].text
-        : script.split(' ').slice(0, 100).join(' ');
-
-      // Build sections for multi-scene generation
-      const sectionsPayload = sections.length > 0
-        ? sections.map((s: Section) => ({ name: s.name, text: s.text }))
-        : [{ name: 'HOOK', text: firstSectionText }];
-
-      const response = await fetch('http://localhost:8000/api/generate-ai-images', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic,
-          script,
-          first_section_text: firstSectionText,
-          sections: sectionsPayload,
-        }),
-      });
-
-      if (!response.ok) throw new Error('AI image generation failed');
-
-      const data = await response.json();
-      setAiImages(data.images || []);
-      setAiPrompt(data.prompts?.[0]?.prompt || null);
-    } catch (err: any) {
-      console.error('AI image generation error:', err);
-    } finally {
-      setIsGeneratingAI(false);
-    }
-  };
-
-  const isComplete = videoUrl !== null;
-  const isProcessing = !isPaused && !isComplete && !error;
+  const validMedia = mediaItems.filter(m => m.media_url);
 
   return (
-    <div className="min-h-screen bg-white flex flex-col">
-      {/* Header */}
-      <header
-        className={`fixed top-0 left-0 right-0 z-50 px-6 py-4 bg-white transition-all duration-300 flex items-center justify-between ${
-          isScrolled ? 'border-b border-gray-200' : ''
-        }`}
-      >
-        <Link href="/" className="text-2xl font-semibold text-foreground">
-          Lola
-        </Link>
-        <div className="flex items-center gap-3">
-          <button className="px-4 py-2 text-sm font-medium text-foreground hover:bg-gray-100 rounded-full transition-colors">
-            Log in
-          </button>
-          <button className="px-4 py-2 text-sm font-medium bg-foreground text-white rounded-full hover:bg-gray-800 transition-colors">
-            Start creating
-          </button>
+    <div className="h-screen bg-[#27272a] flex overflow-hidden">
+      {/* LEFT SIDEBAR - Navigation */}
+      <div className="w-56 bg-[#111113] border-r border-[#1f1f23] flex flex-col">
+        {/* Logo */}
+        <div className="p-4 border-b border-[#1f1f23]">
+          <Link href="/" className="text-xl font-semibold text-white logo-text">
+            Lightfall
+          </Link>
         </div>
-      </header>
 
-      {/* Main content */}
-      <main className="flex-1 px-6 pt-24 pb-10">
-        <div className="max-w-7xl mx-auto space-y-6">
-          <div className="flex items-center justify-between">
-            <h1 className="text-2xl font-semibold text-foreground">
-              {isComplete ? 'Video Complete' : isPaused ? 'Ready for Review' : isProcessing ? 'Generating...' : 'Results'}
-            </h1>
-            {isPaused && (
-              <div className="flex gap-3">
-                <button
-                  onClick={handleGenerateTts}
-                  disabled={isGeneratingTts || !!audioUrl}
-                  className={`px-4 py-2 text-sm font-medium rounded-full transition-colors ${
-                    audioUrl
-                      ? 'bg-gray-100 text-gray-400'
-                      : 'bg-gray-100 text-foreground hover:bg-gray-200'
-                  }`}
-                >
-                  {audioUrl ? '✓ Audio Ready' : isGeneratingTts ? 'Generating...' : 'Generate TTS'}
-                </button>
-                <button
-                  onClick={handleCompileVideo}
-                  disabled={!audioUrl || isCompiling || !!videoUrl}
-                  className={`px-4 py-2 text-sm font-medium rounded-full transition-colors ${
-                    !audioUrl || videoUrl
-                      ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                      : 'bg-foreground text-white hover:bg-gray-800'
-                  }`}
-                >
-                  {videoUrl ? '✓ Video Ready' : isCompiling ? 'Compiling...' : 'Compile Video'}
-                </button>
-              </div>
-            )}
+        {/* Nav Items */}
+        <nav className="flex-1 p-3 space-y-1">
+          <Link
+            href="/dashboard"
+            className="flex items-center gap-3 px-3 py-2.5 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f23] rounded-lg transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+            </svg>
+            Dashboard
+          </Link>
+          <Link
+            href="/dashboard?new=true"
+            className="flex items-center gap-3 px-3 py-2.5 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f23] rounded-lg transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            New Video
+          </Link>
+        </nav>
+
+        {/* User info at bottom */}
+        {user && (
+          <div className="p-3 border-t border-[#1f1f23]">
+            <div className="flex items-center gap-2 p-2 rounded-lg bg-[#1f1f23]">
+              <Link
+                href="/dashboard"
+                className="w-8 h-8 rounded-full bg-white flex items-center justify-center flex-shrink-0 hover:bg-gray-200 transition-colors"
+              >
+                <span className="text-xs font-semibold text-[#27272a]">
+                  {user.email?.charAt(0).toUpperCase() || 'U'}
+                </span>
+              </Link>
+              <Link href="/dashboard" className="flex-1 min-w-0 hover:opacity-80 transition-opacity">
+                <p className="text-xs text-gray-300 truncate">{user.email}</p>
+              </Link>
+              <button
+                onClick={handleLogout}
+                className="p-1.5 text-gray-500 hover:text-white hover:bg-[#2a2a2e] rounded transition-colors"
+                title="Log out"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MAIN CONTENT AREA */}
+      <div className="flex-1 flex flex-col">
+        {/* PROGRESS BAR - spans middle and right sections */}
+        <div className="h-14 bg-[#111113] border-b border-[#1f1f23] flex items-center px-6">
+          <div className="flex items-center gap-1 flex-1">
+            {STEPS.map((step, index) => {
+              const state = stepStates[step.id];
+              const isActive = state.status === 'running';
+              const isDone = state.status === 'done';
+              const isError = state.status === 'error';
+
+              return (
+                <div key={step.id} className="flex items-center">
+                  {/* Step indicator */}
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-md">
+                    {isActive ? (
+                      <span className="w-4 h-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                    ) : isDone ? (
+                      <span className="w-4 h-4 rounded-full bg-green-500 flex items-center justify-center">
+                        <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                        </svg>
+                      </span>
+                    ) : isError ? (
+                      <span className="w-4 h-4 rounded-full bg-red-500 flex items-center justify-center text-white text-[10px]">✕</span>
+                    ) : (
+                      <span className="w-4 h-4 rounded-full border-2 border-[#2a2a2e]" />
+                    )}
+                    <span className={`text-xs font-medium ${isActive ? 'text-blue-400' : isDone ? 'text-green-400' : isError ? 'text-red-400' : 'text-gray-500'}`}>
+                      {step.label}
+                    </span>
+                  </div>
+                  {/* Connector line */}
+                  {index < STEPS.length - 1 && (
+                    <div className={`w-8 h-0.5 ${isDone ? 'bg-green-500/50' : 'bg-[#2a2a2e]'}`} />
+                  )}
+                </div>
+              );
+            })}
           </div>
 
-          {error ? (
-            <div className="bg-white border border-gray-200 rounded-2xl p-6">
-              <p className="text-red-500 mb-4">{error}</p>
-              <button
-                onClick={() => router.push('/')}
-                className="px-4 py-2 text-sm font-medium bg-foreground text-white rounded-full hover:bg-gray-800 transition-colors"
-              >
-                Go Back
-              </button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-              {/* Column 1: Progress & Scripts */}
-              <div className="space-y-4">
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <h3 className="text-sm font-semibold mb-3">Progress</h3>
-                  <div className="space-y-1">
-                    <ProgressStep label="Script" state={scriptStep} />
-                    <ProgressStep label="Media Search" state={videosStep} />
-                    <ProgressStep label="TTS Audio" state={ttsStep} />
-                    <ProgressStep label="Compile" state={compileStep} />
-                  </div>
-                </div>
-
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <h3 className="text-sm font-semibold mb-3">Raw Script</h3>
-                  {sections.length > 0 ? (
-                    <div className="space-y-3 text-xs">
-                      {sections.map((section, index) => (
-                        <div key={index} className="border-l-2 border-gray-300 pl-3 py-1">
-                          <p className="font-semibold text-gray-700 mb-1">[{section.name}]</p>
-                          <p className="text-gray-500 leading-relaxed">{section.text}</p>
-                        </div>
-                      ))}
-                    </div>
-                  ) : script ? (
-                    <p className="text-xs text-gray-500">No section data available</p>
-                  ) : (
-                    <div className="space-y-2">
-                      <div className="h-4 bg-gray-100 rounded animate-pulse" />
-                      <div className="h-4 bg-gray-100 rounded animate-pulse w-3/4" />
-                    </div>
-                  )}
-                </div>
-
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <h3 className="text-sm font-semibold mb-3">Edited Script</h3>
-                  {script ? (
-                    <p className="text-xs leading-relaxed whitespace-pre-wrap text-gray-500">{script}</p>
-                  ) : (
-                    <div className="space-y-2">
-                      <div className="h-4 bg-gray-100 rounded animate-pulse" />
-                      <div className="h-4 bg-gray-100 rounded animate-pulse w-5/6" />
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Column 2: Stock Videos */}
-              <div className="space-y-4">
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-semibold">Stock Videos</h3>
-                    {backgroundType !== 'videos' && isPaused && !videos.some(v => v.video_url) && (
-                      <button
-                        onClick={handleGenerateVideos}
-                        disabled={isGeneratingVideos || !script}
-                        className={`px-2 py-1 text-xs font-medium rounded-full transition-colors ${
-                          isGeneratingVideos
-                            ? 'bg-gray-100 text-gray-400'
-                            : 'bg-gray-100 text-foreground hover:bg-gray-200'
-                        }`}
-                      >
-                        {isGeneratingVideos ? 'Searching...' : 'Generate'}
-                      </button>
-                    )}
-                  </div>
-                  {videos.some(v => v.video_url) ? (
-                    <div className="space-y-3">
-                      {videos.map((video, index) => (
-                        <div key={index} className="p-3 bg-gray-50 rounded-xl">
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="bg-foreground text-white rounded-full w-5 h-5 flex items-center justify-center text-xs font-medium">
-                              {video.scene_number}
-                            </span>
-                            <span className={`text-xs ${video.video_url ? 'text-green-600' : 'text-red-500'}`}>
-                              {video.video_url ? '✓' : '✕'}
-                            </span>
-                            {video.video_source && (
-                              <span className="text-xs text-gray-500">{video.video_source}</span>
-                            )}
-                          </div>
-                          <p className="text-xs text-gray-500 mb-1">
-                            Query: "{video.video_search_query || video.search_query}"
-                          </p>
-                          {video.video_url && (
-                            <a
-                              href={video.video_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-xs text-blue-600 hover:underline break-all"
-                            >
-                              Preview video →
-                            </a>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : isGeneratingVideos ? (
-                    <div className="space-y-2">
-                      <div className="h-16 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-16 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType === 'videos' && videosStep.status === 'running' ? (
-                    <div className="space-y-2">
-                      <div className="h-16 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-16 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType !== 'videos' ? (
-                    <p className="text-xs text-gray-500">Click Generate to search for videos</p>
-                  ) : (
-                    <p className="text-xs text-gray-500">Waiting...</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Column 3: Google Images */}
-              <div className="space-y-4">
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-semibold">Google Images</h3>
-                    {backgroundType !== 'images' && isPaused && !videos.some(v => v.images?.length > 0) && (
-                      <button
-                        onClick={handleGenerateImages}
-                        disabled={isGeneratingImages || !script}
-                        className={`px-2 py-1 text-xs font-medium rounded-full transition-colors ${
-                          isGeneratingImages
-                            ? 'bg-gray-100 text-gray-400'
-                            : 'bg-gray-100 text-foreground hover:bg-gray-200'
-                        }`}
-                      >
-                        {isGeneratingImages ? 'Searching...' : 'Generate'}
-                      </button>
-                    )}
-                  </div>
-                  {videos.some(v => v.images?.length > 0) ? (
-                    <div className="space-y-3">
-                      {videos.map((video, index) => (
-                        <div key={index} className="p-3 bg-gray-50 rounded-xl">
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="bg-foreground text-white rounded-full w-5 h-5 flex items-center justify-center text-xs font-medium">
-                              {video.scene_number}
-                            </span>
-                            <span className={`text-xs ${video.images?.length > 0 ? 'text-green-600' : 'text-red-500'}`}>
-                              {video.images?.length || 0} images
-                            </span>
-                          </div>
-                          <p className="text-xs text-gray-500 mb-2">
-                            Query: "{video.image_search_query || video.search_query}"
-                          </p>
-                          {video.images && video.images.length > 0 && (
-                            <a
-                              href={video.images[0].url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="block"
-                            >
-                              <img
-                                src={video.images[0].thumbnail_url || video.images[0].url}
-                                alt={video.images[0].title || 'Scene image'}
-                                className="w-full h-20 object-cover rounded-lg border border-gray-200 hover:border-gray-400 transition-colors"
-                              />
-                              <p className="text-xs text-gray-500 mt-1 truncate">
-                                {video.images[0].title}
-                              </p>
-                            </a>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : isGeneratingImages ? (
-                    <div className="space-y-2">
-                      <div className="h-24 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-24 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType === 'images' && videosStep.status === 'running' ? (
-                    <div className="space-y-2">
-                      <div className="h-24 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-24 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType !== 'images' ? (
-                    <p className="text-xs text-gray-500">Click Generate to search for images</p>
-                  ) : (
-                    <p className="text-xs text-gray-500">Waiting...</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Column 4: AI Generated Images */}
-              <div className="space-y-4">
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-semibold">AI Images</h3>
-                    {backgroundType !== 'ai' && isPaused && aiImages.length === 0 && (
-                      <button
-                        onClick={handleGenerateAI}
-                        disabled={isGeneratingAI || !script}
-                        className={`px-2 py-1 text-xs font-medium rounded-full transition-colors ${
-                          isGeneratingAI
-                            ? 'bg-gray-100 text-gray-400'
-                            : 'bg-gray-100 text-foreground hover:bg-gray-200'
-                        }`}
-                      >
-                        {isGeneratingAI ? 'Generating...' : 'Generate'}
-                      </button>
-                    )}
-                  </div>
-                  {aiImages.length > 0 ? (
-                    <div className="space-y-3">
-                      {/* Display images by scene */}
-                      {aiImages.map((img: any, index: number) => (
-                        <div key={index} className="p-3 bg-gray-50 rounded-xl">
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="bg-foreground text-white rounded-full w-5 h-5 flex items-center justify-center text-xs font-medium">
-                              {img.scene_number || index + 1}
-                            </span>
-                            <span className="text-xs font-medium">{img.section_name || `Scene ${img.scene_number}`}</span>
-                            <span className={`text-xs ${img.url ? 'text-green-600' : 'text-red-500'}`}>
-                              {img.url ? '✓' : '✕'}
-                            </span>
-                          </div>
-                          {img.url ? (
-                            <a
-                              href={img.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="block"
-                            >
-                              <img
-                                src={img.url}
-                                alt={`AI - ${img.section_name || `Scene ${img.scene_number}`}`}
-                                className="w-full h-24 object-cover rounded-lg border border-gray-200 hover:border-gray-400 transition-colors"
-                              />
-                              <p className="text-[10px] text-gray-400 mt-1">
-                                {img.model_name} {img.width > 0 && `• ${img.width}x${img.height}`}
-                              </p>
-                            </a>
-                          ) : (
-                            <p className="text-xs text-red-500">{img.error || 'Failed'}</p>
-                          )}
-                        </div>
-                      ))}
-                      <p className="text-[10px] text-gray-400">
-                        {aiImages.filter((i: any) => i.url).length}/{aiImages.length} generated
-                      </p>
-                    </div>
-                  ) : isGeneratingAI ? (
-                    <div className="space-y-2">
-                      <p className="text-xs text-gray-500 mb-2">Generating images for all scenes...</p>
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType === 'ai' && videosStep.status === 'running' ? (
-                    <div className="space-y-2">
-                      <p className="text-xs text-gray-500 mb-2">Generating images for all scenes...</p>
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                      <div className="h-28 bg-gray-100 rounded-xl animate-pulse" />
-                    </div>
-                  ) : backgroundType !== 'ai' ? (
-                    <p className="text-xs text-gray-500">Click Generate to create AI images</p>
-                  ) : (
-                    <p className="text-xs text-gray-500">Waiting...</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Column 5: Final Video & Audio */}
-              <div className="space-y-4">
-                {audioUrl && (
-                  <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                    <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
-                      Audio
-                      <span className="text-xs bg-gray-100 px-2 py-0.5 rounded-full text-gray-600">
-                        {ttsProvider}
-                      </span>
-                    </h3>
-                    <audio controls className="w-full" src={audioUrl}>
-                      Your browser does not support audio.
-                    </audio>
-                  </div>
-                )}
-
-                <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                  <h3 className="text-sm font-semibold mb-3">Final Video</h3>
-                  {videoUrl ? (
-                    <video
-                      controls
-                      autoPlay
-                      className="w-full rounded-xl"
-                      style={{ aspectRatio: '9/16', maxHeight: '400px' }}
-                    >
-                      <source src={videoUrl} type="video/mp4" />
-                    </video>
-                  ) : (
-                    <div
-                      className="w-full bg-gray-50 rounded-xl flex items-center justify-center"
-                      style={{ aspectRatio: '9/16', maxHeight: '300px' }}
-                    >
-                      {compileStep.status === 'running' ? (
-                        <div className="text-center">
-                          <span className="block w-8 h-8 mx-auto mb-2 rounded-full border-2 border-foreground border-t-transparent animate-spin" />
-                          <p className="text-xs text-gray-500">Compiling...</p>
-                        </div>
-                      ) : isPaused && !audioUrl ? (
-                        <p className="text-xs text-gray-500 text-center px-4">
-                          Click "Generate TTS" then "Compile Video"
-                        </p>
-                      ) : isPaused && audioUrl ? (
-                        <p className="text-xs text-gray-500 text-center px-4">
-                          Click "Compile Video" to create final video
-                        </p>
-                      ) : (
-                        <p className="text-xs text-gray-500">Waiting...</p>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {!error && (
-            <div className="flex justify-center pt-6">
-              <button
-                onClick={() => router.push('/')}
-                className="px-4 py-2 text-sm font-medium bg-gray-100 text-foreground rounded-full hover:bg-gray-200 transition-colors"
-              >
-                Create Another
-              </button>
-            </div>
+          {/* Video ready badge */}
+          {videoUrl && (
+            <span className="px-3 py-1 text-xs font-medium bg-green-500/20 text-green-400 rounded-full border border-green-500/30">
+              Video Ready
+            </span>
           )}
         </div>
-      </main>
+
+        {/* CONTENT AREA - Middle and Right sections */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* MIDDLE SECTION - Tabs */}
+          <div className="flex-1 flex flex-col border-r border-[#1f1f23]">
+            {/* Tabs */}
+            <div className="flex border-b border-[#1f1f23]">
+              {(['script', 'audio', 'clauses', 'media'] as TabType[]).map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  className={`px-5 py-3 text-sm font-medium transition-colors ${
+                    activeTab === tab
+                      ? 'text-white border-b-2 border-blue-500 bg-[#1f1f23]/50'
+                      : 'text-gray-500 hover:text-gray-300 hover:bg-[#1f1f23]/30'
+                  }`}
+                >
+                  {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                </button>
+              ))}
+            </div>
+
+            {/* Tab Content */}
+            <div className="flex-1 overflow-y-auto p-5">
+              {error && (
+                <div className="mb-4 p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
+                  <p className="text-red-400 text-sm">{error}</p>
+                </div>
+              )}
+
+              {/* Script Tab */}
+              {activeTab === 'script' && (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-3">Generated Script</h3>
+                  {script ? (
+                    <p className="text-sm text-gray-200 leading-relaxed whitespace-pre-wrap">{script}</p>
+                  ) : scriptStep.status === 'running' ? (
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <span className="w-4 h-4 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                      <span className="text-sm">Generating script...</span>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-500">Script will appear here...</p>
+                  )}
+                </div>
+              )}
+
+              {/* Audio Tab */}
+              {activeTab === 'audio' && (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-3 flex items-center gap-2">
+                    Audio
+                    {audioUrl && (
+                      <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">
+                        {ttsProvider}
+                      </span>
+                    )}
+                  </h3>
+                  {audioUrl ? (
+                    <audio controls className="w-full max-w-md" src={audioUrl}>
+                      Your browser does not support audio.
+                    </audio>
+                  ) : ttsStep.status === 'running' ? (
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <span className="w-4 h-4 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                      <span className="text-sm">Generating audio...</span>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-500">Audio will appear here...</p>
+                  )}
+                </div>
+              )}
+
+              {/* Clauses Tab */}
+              {activeTab === 'clauses' && (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-3">
+                    Clauses {clauses.length > 0 && <span className="text-gray-600">({clauses.length})</span>}
+                  </h3>
+                  {clauses.length > 0 ? (
+                    <div className="space-y-3">
+                      {clauses.map((clause) => (
+                        <div key={clause.clause_id} className="p-3 bg-[#1f1f23] rounded-lg border border-[#2a2a2e]">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-xs font-medium text-blue-400">#{clause.clause_id}</span>
+                            <span className="text-xs px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded">{clause.idea_type}</span>
+                            <span className="text-xs text-gray-500">
+                              {clause.start_time.toFixed(1)}s - {clause.next_start_time.toFixed(1)}s
+                            </span>
+                          </div>
+                          <p className="text-sm text-gray-300">{clause.text}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : clausesStep.status === 'running' ? (
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <span className="w-4 h-4 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                      <span className="text-sm">Segmenting clauses...</span>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-500">Clauses will appear here...</p>
+                  )}
+                </div>
+              )}
+
+              {/* Media Tab */}
+              {activeTab === 'media' && (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-3">
+                    Media {mediaItems.length > 0 && <span className="text-gray-600">({validMedia.length}/{mediaItems.length} loaded)</span>}
+                  </h3>
+                  {mediaItems.length > 0 ? (
+                    <div className="grid grid-cols-2 gap-3">
+                      {mediaItems.map((item) => {
+                        const clause = clauses.find(c => c.clause_id === item.clause_id);
+                        const isVideo = item.media_type.includes('video');
+                        const isImage = item.media_type.includes('image');
+
+                        return (
+                          <div key={item.clause_id} className="bg-[#1f1f23] rounded-lg border border-[#2a2a2e] overflow-hidden">
+                            <div className="p-2 border-b border-[#2a2a2e]">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-medium text-gray-300">#{item.clause_id}</span>
+                                <span className={`text-xs px-1.5 py-0.5 rounded ${
+                                  item.media_type === 'stock_video' ? 'bg-blue-500/20 text-blue-400' :
+                                  item.media_type === 'youtube_video' ? 'bg-red-500/20 text-red-400' :
+                                  item.media_type === 'ai_video' ? 'bg-purple-500/20 text-purple-400' :
+                                  item.media_type === 'ai_image' ? 'bg-pink-500/20 text-pink-400' :
+                                  item.media_type === 'web_image' ? 'bg-green-500/20 text-green-400' :
+                                  'bg-gray-500/20 text-gray-400'
+                                }`}>
+                                  {item.media_type.replace('_', ' ')}
+                                </span>
+                                <span className="text-xs text-gray-500 ml-auto">{item.duration.toFixed(1)}s</span>
+                              </div>
+                              {clause && (
+                                <p className="text-xs text-gray-500 mt-1 line-clamp-1">{clause.text}</p>
+                              )}
+                            </div>
+                            <div className="aspect-video bg-black">
+                              {item.media_url ? (
+                                isVideo ? (
+                                  <video
+                                    src={item.media_url}
+                                    className="w-full h-full object-cover"
+                                    muted
+                                    playsInline
+                                    onMouseEnter={(e) => (e.target as HTMLVideoElement).play()}
+                                    onMouseLeave={(e) => {
+                                      (e.target as HTMLVideoElement).pause();
+                                      (e.target as HTMLVideoElement).currentTime = 0;
+                                    }}
+                                  />
+                                ) : isImage ? (
+                                  <img src={item.media_url} alt={`Clause ${item.clause_id}`} className="w-full h-full object-cover" />
+                                ) : null
+                              ) : item.error ? (
+                                <div className="w-full h-full flex items-center justify-center bg-red-500/10">
+                                  <p className="text-xs text-red-400 text-center px-2">{item.error}</p>
+                                </div>
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center">
+                                  <span className="w-4 h-4 rounded-full border-2 border-gray-600 border-t-transparent animate-spin" />
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : mediaStep.status === 'running' || routingStep.status === 'running' ? (
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <span className="w-4 h-4 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                      <span className="text-sm">{routingStep.status === 'running' ? 'Planning media...' : 'Retrieving media...'}</span>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-500">Media will appear here...</p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* RIGHT SECTION - Final Video */}
+          <div className="w-80 bg-[#111113] flex flex-col">
+            <div className="p-4 border-b border-[#1f1f23] flex items-center justify-between">
+              <h3 className="text-sm font-medium text-gray-400">Final Video</h3>
+              {totalDuration > 0 && (
+                <span className="text-xs text-gray-500">
+                  {totalDuration.toFixed(1)}s
+                </span>
+              )}
+            </div>
+            <div className="flex-1 flex items-center justify-center p-4">
+              {videoUrl ? (
+                <video
+                  controls
+                  autoPlay
+                  className="w-full rounded-lg"
+                  style={{ aspectRatio: '9/16', maxHeight: 'calc(100vh - 10rem)' }}
+                >
+                  <source src={videoUrl} type="video/mp4" />
+                </video>
+              ) : (
+                <div
+                  className="w-full bg-[#1f1f23] rounded-lg flex items-center justify-center border border-[#2a2a2e]"
+                  style={{ aspectRatio: '9/16', maxHeight: 'calc(100vh - 10rem)' }}
+                >
+                  {compileStep.status === 'running' ? (
+                    <div className="text-center">
+                      <span className="block w-8 h-8 mx-auto mb-3 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                      <p className="text-sm text-gray-400">Compiling...</p>
+                      <p className="text-xs text-gray-500 mt-1">{compileStep.message}</p>
+                    </div>
+                  ) : mediaStep.status === 'done' ? (
+                    <div className="text-center">
+                      <span className="block w-6 h-6 mx-auto mb-2 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                      <p className="text-xs text-gray-500">Preparing...</p>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-500">Video preview</p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Help button */}
+      <div className="fixed bottom-5 left-5 z-50" ref={helpRef}>
+        <button
+          onClick={() => setIsHelpOpen(!isHelpOpen)}
+          className="w-7 h-7 rounded-full bg-[#3f3f46] hover:bg-[#52525b] flex items-center justify-center text-gray-300 hover:text-white transition-colors text-sm font-medium shadow-lg"
+        >
+          ?
+        </button>
+
+        {/* Help popup */}
+        <div
+          className={`absolute bottom-full left-0 mb-2 bg-[#1f1f23] rounded-2xl shadow-md border border-[#2a2a2e] px-4 py-3 transition-all duration-200 origin-bottom-left ${
+            isHelpOpen
+              ? 'opacity-100 scale-100'
+              : 'opacity-0 scale-95 pointer-events-none'
+          }`}
+        >
+          <p className="text-xs text-gray-500 mb-1">Need help?</p>
+          <a
+            href="mailto:bradshaw.hyrum@gmail.com"
+            className="text-xs text-gray-400 underline inline-flex items-center gap-1 hover:text-gray-300 transition-colors"
+          >
+            bradshaw.hyrum@gmail.com
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+          </a>
+        </div>
+      </div>
     </div>
   );
 }
@@ -895,10 +643,10 @@ export default function ResultsPage() {
   return (
     <Suspense
       fallback={
-        <div className="min-h-screen bg-white flex items-center justify-center">
+        <div className="h-screen bg-[#27272a] flex items-center justify-center">
           <div className="text-center">
-            <div className="w-12 h-12 mx-auto mb-4 rounded-full border-2 border-foreground border-t-transparent animate-spin" />
-            <p className="text-gray-500">Loading...</p>
+            <div className="w-10 h-10 mx-auto mb-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+            <p className="text-gray-500 text-sm">Loading...</p>
           </div>
         </div>
       }

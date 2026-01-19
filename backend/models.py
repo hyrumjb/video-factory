@@ -39,22 +39,16 @@ class VideoSearchResponse(BaseModel):
     videos: list[VideoItem]
 
 
-class SceneTimingInfo(BaseModel):
-    scene_number: int
-    word_start: Optional[int] = None  # Starting word index
-    word_end: Optional[int] = None  # Ending word index
-
-
 class CompileVideoRequest(BaseModel):
-    video_urls: List[str]  # List of video/image URLs to combine
+    """Request model for video compilation endpoint."""
+    video_urls: List[str] = []  # List of video/image URLs
     audio_url: str  # Base64 audio data URL
     script: str  # Script text for captions
-    scene_durations: Optional[List[float]] = None  # Duration for each scene in seconds
+    scene_durations: Optional[List[float]] = None  # Duration for each scene
     voice_name: Optional[str] = "en-US-Neural2-H"  # Voice used for TTS
     alignment: Optional[dict] = None  # ElevenLabs word-level timing data for captions
     tts_provider: Optional[str] = "google"  # "google" or "elevenlabs"
-    scenes: Optional[List[SceneTimingInfo]] = None  # Scene word boundaries for timing
-    use_images: Optional[bool] = False  # If True, video_urls contains images to convert to video
+    use_images: Optional[bool] = False  # If True, treat video_urls as images
 
 
 class CompileVideoResponse(BaseModel):
@@ -62,27 +56,11 @@ class CompileVideoResponse(BaseModel):
 
 
 # Response models
-class VideoScene(BaseModel):
-    scene_number: int
-    description: str
-    search_keywords: str
-    search_query: str  # Optimized 3-5 word query for stock video APIs
-    section_name: Optional[str] = None  # e.g., "HOOK", "BODY1"
-    word_start: Optional[int] = None  # Starting word index in script
-    word_end: Optional[int] = None  # Ending word index in script
-
-
-class ScriptSection(BaseModel):
-    name: str  # "HOOK", "BODY1", etc.
-    text: str  # The text content of this section
-    word_start: int  # Starting word index (0-based)
-    word_end: int  # Ending word index (exclusive)
-
-
 class ScriptResponse(BaseModel):
+    """Response model for script generation."""
     script: str  # Clean script for TTS (no section labels)
-    scenes: list[VideoScene]
-    sections: Optional[List[ScriptSection]] = None  # Section boundaries for timing
+    scenes: list = []  # Deprecated - kept for API compatibility
+    sections: Optional[list] = None  # Deprecated - kept for API compatibility
 
 
 class TTSResponse(BaseModel):

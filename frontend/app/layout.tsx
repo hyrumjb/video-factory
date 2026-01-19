@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import FirebaseProvider from "@/components/FirebaseProvider";
 
 export const metadata: Metadata = {
-  title: "Video Factory",
+  title: "Lightfall",
   description: "Create beautiful videos with zero effort",
 };
 
@@ -13,7 +14,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <FirebaseProvider>
+          {children}
+        </FirebaseProvider>
+      </body>
     </html>
   );
 }
