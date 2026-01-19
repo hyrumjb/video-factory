@@ -126,7 +126,8 @@ function ResultsContent() {
     }
 
     const existingJobId = sessionStorage.getItem('currentJobId');
-    let url = `http://localhost:8000/api/create-video?topic=${encodeURIComponent(currentTopic.trim())}&voice_id=${encodeURIComponent(voiceId)}&input_mode=${encodeURIComponent(inputMode)}`;
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    let url = `${apiUrl}/api/create-video?topic=${encodeURIComponent(currentTopic.trim())}&voice_id=${encodeURIComponent(voiceId)}&input_mode=${encodeURIComponent(inputMode)}`;
     if (existingJobId) {
       url += `&job_id=${encodeURIComponent(existingJobId)}`;
     }

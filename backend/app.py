@@ -219,9 +219,18 @@ def get_voice_params(voice_name: str) -> tuple:
 
 
 # CORS middleware to allow frontend requests
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+allowed_origins = [
+    "http://localhost:3000",
+    FRONTEND_URL,
+    "https://lightfall.ai",
+    "https://www.lightfall.ai",
+]
+# Also allow any vercel.app subdomain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js default port
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

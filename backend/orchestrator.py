@@ -57,10 +57,10 @@ def _convert_local_path_to_api_url(local_path: str) -> str:
 
     Examples:
         /var/folders/.../video_factory_cache/stock_videos/pexels_abc.mp4
-        -> http://localhost:8000/api/media/stock_videos/pexels_abc.mp4
+        -> {BACKEND_URL}/api/media/stock_videos/pexels_abc.mp4
 
         /Users/.../backend/youtube_cache/yt_clip_abc.mp4
-        -> http://localhost:8000/api/media/youtube/yt_clip_abc.mp4
+        -> {BACKEND_URL}/api/media/youtube/yt_clip_abc.mp4
     """
     import re
 
@@ -71,6 +71,9 @@ def _convert_local_path_to_api_url(local_path: str) -> str:
     if local_path.startswith(('http://', 'https://', 'data:')):
         return local_path
 
+    # Get backend URL from environment (for production deployment)
+    backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+
     # Check if it's a video_factory_cache file path
     if 'video_factory_cache' in local_path:
         # Extract media type and filename from path
@@ -79,7 +82,7 @@ def _convert_local_path_to_api_url(local_path: str) -> str:
         if match:
             media_type = match.group(1)
             filename = match.group(2)
-            return f"http://localhost:8000/api/media/{media_type}/{filename}"
+            return f"{backend_url}/api/media/{media_type}/{filename}"
 
     # Check if it's a YouTube cache file path
     if 'youtube_cache' in local_path:
@@ -88,7 +91,7 @@ def _convert_local_path_to_api_url(local_path: str) -> str:
         match = re.search(r'youtube_cache/([^/]+)$', local_path)
         if match:
             filename = match.group(1)
-            return f"http://localhost:8000/api/media/youtube/{filename}"
+            return f"{backend_url}/api/media/youtube/{filename}"
 
     # For any other local path, try to extract just the filename and serve via generic endpoint
     if local_path.startswith('/'):
@@ -96,9 +99,9 @@ def _convert_local_path_to_api_url(local_path: str) -> str:
         # Determine media type from extension
         ext = os.path.splitext(filename)[1].lower()
         if ext in ['.mp4', '.webm', '.mkv', '.mov']:
-            return f"http://localhost:8000/api/media/stock_videos/{filename}"
+            return f"{backend_url}/api/media/stock_videos/{filename}"
         elif ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
-            return f"http://localhost:8000/api/media/web_images/{filename}"
+            return f"{backend_url}/api/media/web_images/{filename}"
 
     return local_path
 
