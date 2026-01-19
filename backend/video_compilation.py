@@ -188,35 +188,51 @@ def _process_media_segment(
 
 
 def _concatenate_segments(segment_paths: List[Path], output_path: Path) -> None:
-    """Concatenate multiple video segments."""
+    """Concatenate multiple video segments using concat demuxer (memory-efficient)."""
     if len(segment_paths) == 1:
         import shutil
         shutil.copy(segment_paths[0], output_path)
         return
 
-    # Build filter_complex for concatenation
-    cmd = [FFMPEG_EXECUTABLE, '-y']
-    for path in segment_paths:
-        cmd.extend(['-i', str(path)])
+    # Use concat demuxer (much more memory-efficient than filter_complex)
+    # Create a concat list file
+    concat_list_path = output_path.parent / "concat_list.txt"
+    with open(concat_list_path, 'w') as f:
+        for path in segment_paths:
+            # Use absolute paths and escape single quotes
+            f.write(f"file '{str(path.absolute())}'\n")
 
-    filter_parts = []
-    for i in range(len(segment_paths)):
-        filter_parts.append(f"[{i}:v]setsar=1[v{i}]")
-
-    concat_inputs = ''.join([f"[v{i}]" for i in range(len(segment_paths))])
-    filter_parts.append(f"{concat_inputs}concat=n={len(segment_paths)}:v=1:a=0[outv]")
-
-    cmd.extend([
-        '-filter_complex', ';'.join(filter_parts),
-        '-map', '[outv]',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
-        '-b:v', '3000k',
+    # First try with stream copy (fastest, no re-encoding)
+    cmd = [
+        FFMPEG_EXECUTABLE, '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', str(concat_list_path),
+        '-c', 'copy',
         str(output_path)
-    ])
+    ]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=300, text=True)
-        print(f"✓ Concatenated {len(segment_paths)} segments")
+        print(f"✓ Concatenated {len(segment_paths)} segments (stream copy)")
+        return
+    except subprocess.CalledProcessError:
+        print("⚠ Stream copy failed, trying re-encode...")
+
+    # Fallback: re-encode with concat demuxer (still memory-efficient)
+    cmd = [
+        FFMPEG_EXECUTABLE, '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', str(concat_list_path),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+        '-b:v', '3000k',
+        str(output_path)
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300, text=True)
+        print(f"✓ Concatenated {len(segment_paths)} segments (re-encoded)")
     except subprocess.CalledProcessError as e:
         print(f"✗ Concatenation failed: {e.stderr[:500] if e.stderr else 'Unknown error'}")
         raise HTTPException(status_code=500, detail="Failed to concatenate video segments")
@@ -572,58 +588,54 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         # Output video path
         output_path = temp_path / "final_video.mp4"
         
-        # Step 1: Concatenate trimmed videos and scale to vertical format
-        if len(trimmed_videos) == 1:
-            # Single video - just scale it to vertical format
-            concat_video_path = temp_path / "concatenated.mp4"
+        # Step 1: Scale videos to vertical format, then concatenate
+        concat_video_path = temp_path / "concatenated.mp4"
+
+        # First, scale each video individually (memory-efficient)
+        scaled_videos = []
+        for i, trimmed_path in enumerate(trimmed_videos):
+            scaled_path = temp_path / f"scaled_{i:03d}.mp4"
             scale_cmd = [
                 FFMPEG_EXECUTABLE, '-y',
-                '-i', str(trimmed_videos[0]),
-                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                '-i', str(trimmed_path),
+                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
                 '-b:v', '3000k',
                 '-an',
-                str(concat_video_path)
+                str(scaled_path)
             ]
             try:
-                result = subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
-                print(f"✓ Scaled single video to vertical format")
+                subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
+                scaled_videos.append(scaled_path)
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr if e.stderr else 'Unknown error'
-                print(f"✗ Failed to scale video: {error_msg[:200]}")
-                raise HTTPException(status_code=500, detail="Failed to scale video")
+                print(f"✗ Failed to scale video {i+1}: {error_msg[:200]}")
+                raise HTTPException(status_code=500, detail=f"Failed to scale video {i+1}")
+
+        print(f"✓ Scaled {len(scaled_videos)} videos to vertical format")
+
+        # Then concatenate using concat demuxer (memory-efficient)
+        if len(scaled_videos) == 1:
+            import shutil
+            shutil.copy(scaled_videos[0], concat_video_path)
         else:
-            # Multiple videos - concatenate them and scale to vertical
-            concat_video_path = temp_path / "concatenated.mp4"
+            concat_list_path = temp_path / "concat_list.txt"
+            with open(concat_list_path, 'w') as f:
+                for path in scaled_videos:
+                    f.write(f"file '{str(path.absolute())}'\n")
+
             concat_cmd = [
                 FFMPEG_EXECUTABLE, '-y',
-            ]
-            
-            # Add all input videos
-            for trimmed_path in trimmed_videos:
-                concat_cmd.extend(['-i', str(trimmed_path)])
-            
-            # Build filter_complex: scale each to 1080x1920, then concatenate
-            filter_parts = []
-            for i in range(len(trimmed_videos)):
-                filter_parts.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]")
-            
-            concat_inputs = ''.join([f"[v{i}]" for i in range(len(trimmed_videos))])
-            filter_parts.append(f"{concat_inputs}concat=n={len(trimmed_videos)}:v=1:a=0[outv]")
-            
-            filter_complex = ';'.join(filter_parts)
-            
-            concat_cmd.extend([
-                '-filter_complex', filter_complex,
-                '-map', '[outv]',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
-                '-b:v', '3000k',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', str(concat_list_path),
+                '-c', 'copy',
                 str(concat_video_path)
-            ])
-            
+            ]
+
             try:
-                result = subprocess.run(concat_cmd, check=True, capture_output=True, timeout=180, text=True)
-                print(f"✓ Concatenated {len(trimmed_videos)} videos")
+                subprocess.run(concat_cmd, check=True, capture_output=True, timeout=180, text=True)
+                print(f"✓ Concatenated {len(scaled_videos)} videos")
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ FFmpeg concat error: {error_msg[:500]}")
