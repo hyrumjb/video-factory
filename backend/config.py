@@ -4,11 +4,77 @@ This module contains common configuration variables used across multiple modules
 """
 
 import os
+import shutil
+import tempfile
 from typing import Optional, Any
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# =============================================================================
+# RESOURCE LIMITS
+# =============================================================================
+
+# Maximum disk usage for cache directories (in bytes)
+# 2GB total limit
+MAX_CACHE_SIZE_BYTES: int = 2 * 1024 * 1024 * 1024
+
+# Job TTL - videos deleted after 30 minutes
+JOB_TTL_SECONDS: int = 30 * 60  # 30 minutes
+
+# Cache directory
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "video_factory_cache")
+
+
+def get_cache_size() -> int:
+    """Get total size of cache directory in bytes."""
+    total_size = 0
+    if os.path.exists(CACHE_DIR):
+        for dirpath, dirnames, filenames in os.walk(CACHE_DIR):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total_size += os.path.getsize(fp)
+                except OSError:
+                    pass
+    return total_size
+
+
+def cleanup_cache_if_needed(max_size: int = MAX_CACHE_SIZE_BYTES) -> None:
+    """Delete oldest files if cache exceeds max size."""
+    current_size = get_cache_size()
+    if current_size <= max_size:
+        return
+
+    print(f"⚠ Cache size ({current_size / 1024 / 1024:.1f}MB) exceeds limit ({max_size / 1024 / 1024:.1f}MB), cleaning up...")
+
+    # Get all files with their modification times
+    files = []
+    if os.path.exists(CACHE_DIR):
+        for dirpath, dirnames, filenames in os.walk(CACHE_DIR):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    files.append((fp, os.path.getmtime(fp), os.path.getsize(fp)))
+                except OSError:
+                    pass
+
+    # Sort by modification time (oldest first)
+    files.sort(key=lambda x: x[1])
+
+    # Delete oldest files until under limit
+    for fp, mtime, size in files:
+        if current_size <= max_size * 0.8:  # Clean to 80% of limit
+            break
+        try:
+            os.remove(fp)
+            current_size -= size
+            print(f"  🗑 Deleted: {os.path.basename(fp)}")
+        except OSError:
+            pass
+
+    print(f"  ✓ Cache cleaned to {current_size / 1024 / 1024:.1f}MB")
 
 # FFmpeg/FFprobe executables
 FFMPEG_EXECUTABLE: str = 'ffmpeg'

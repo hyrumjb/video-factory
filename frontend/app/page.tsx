@@ -6,6 +6,18 @@ import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
 import { logOut } from '@/lib/firebase';
 
+const IDEA_PLACEHOLDERS = [
+  'Your prompt here...',
+  'Tell us a story...',
+  'I want to see...'
+];
+
+const SCRIPT_PLACEHOLDERS = [
+  'Paste your script here...',
+  'Write your narration...',
+  'Enter your script...'
+];
+
 export default function Home() {
   const [topic, setTopic] = useState('');
   const [placeholder, setPlaceholder] = useState('');
@@ -48,20 +60,6 @@ export default function Home() {
     { id: 'XB0fDUnXU5powFXDhCwa', name: 'Charlotte', description: 'Female, Swedish, seductive' },
   ];
 
-  const ideaPlaceholders = [
-    'Your prompt here...',
-    'Tell us a story...',
-    'I want to see...'
-  ];
-
-  const scriptPlaceholders = [
-    'Paste your script here...',
-    'Write your narration...',
-    'Enter your script...'
-  ];
-
-  const placeholders = inputMode === 'idea' ? ideaPlaceholders : scriptPlaceholders;
-
   const currentIndexRef = useRef(0);
   const currentTextRef = useRef('');
   const isDeletingRef = useRef(false);
@@ -85,6 +83,9 @@ export default function Home() {
     if (topic.trim().length > 0) {
       return;
     }
+
+    // Get the appropriate placeholders based on current mode
+    const placeholders = inputMode === 'idea' ? IDEA_PLACEHOLDERS : SCRIPT_PLACEHOLDERS;
 
     const type = () => {
       const currentPlaceholder = placeholders[currentIndexRef.current];
@@ -127,7 +128,7 @@ export default function Home() {
         timeoutRef.current = null;
       }
     };
-  }, [inputMode, topic, placeholders]);
+  }, [inputMode, topic]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -162,22 +163,16 @@ export default function Home() {
             <div className="w-8 h-8 rounded-full bg-[#3f3f46] animate-pulse" />
           ) : user ? (
             <div className="flex items-center gap-2 bg-[#1f1f23] rounded-full pl-1 pr-1 py-1">
-              {/* User avatar - clickable to go to dashboard */}
-              <button
-                onClick={() => router.push('/dashboard')}
-                className="w-7 h-7 rounded-full bg-white flex items-center justify-center hover:bg-gray-200 transition-colors"
-              >
+              {/* User avatar */}
+              <div className="w-7 h-7 rounded-full bg-white flex items-center justify-center">
                 <span className="text-xs font-semibold text-[#27272a]">
                   {user.email?.charAt(0).toUpperCase() || 'U'}
                 </span>
-              </button>
-              {/* Email - hidden on mobile, clickable to go to dashboard */}
-              <button
-                onClick={() => router.push('/dashboard')}
-                className="text-sm text-gray-300 hidden sm:block max-w-[150px] truncate hover:text-white transition-colors"
-              >
+              </div>
+              {/* Email - hidden on mobile */}
+              <span className="text-sm text-gray-300 hidden sm:block max-w-[150px] truncate">
                 {user.email}
-              </button>
+              </span>
               {/* Logout button */}
               <button
                 onClick={handleLogout}

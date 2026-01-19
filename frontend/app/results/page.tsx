@@ -53,12 +53,10 @@ function ResultsContent() {
   const router = useRouter();
   const { user } = useAuth();
   const [error, setError] = useState<string | null>(null);
-  const [isHelpOpen, setIsHelpOpen] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const topicRef = useRef<string | null>(null);
   const voiceIdRef = useRef<string>('nPczCjzI2devNBz1zQrb');
   const inputModeRef = useRef<'idea' | 'script'>('idea');
-  const helpRef = useRef<HTMLDivElement>(null);
 
   const handleLogout = async () => {
     try {
@@ -88,17 +86,6 @@ function ResultsContent() {
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [totalDuration, setTotalDuration] = useState<number>(0);
-
-  // Handle click outside for help popup
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (helpRef.current && !helpRef.current.contains(event.target as Node)) {
-        setIsHelpOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
 
   const stepStates: Record<string, StepState> = {
     script: scriptStep,
@@ -281,16 +268,16 @@ function ResultsContent() {
         {/* Nav Items */}
         <nav className="flex-1 p-3 space-y-1">
           <Link
-            href="/dashboard"
+            href="/"
             className="flex items-center gap-3 px-3 py-2.5 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f23] rounded-lg transition-colors"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
             </svg>
-            Dashboard
+            Home
           </Link>
           <Link
-            href="/dashboard?new=true"
+            href="/"
             className="flex items-center gap-3 px-3 py-2.5 text-sm text-gray-400 hover:text-white hover:bg-[#1f1f23] rounded-lg transition-colors"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -304,17 +291,14 @@ function ResultsContent() {
         {user && (
           <div className="p-3 border-t border-[#1f1f23]">
             <div className="flex items-center gap-2 p-2 rounded-lg bg-[#1f1f23]">
-              <Link
-                href="/dashboard"
-                className="w-8 h-8 rounded-full bg-white flex items-center justify-center flex-shrink-0 hover:bg-gray-200 transition-colors"
-              >
+              <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center flex-shrink-0">
                 <span className="text-xs font-semibold text-[#27272a]">
                   {user.email?.charAt(0).toUpperCase() || 'U'}
                 </span>
-              </Link>
-              <Link href="/dashboard" className="flex-1 min-w-0 hover:opacity-80 transition-opacity">
+              </div>
+              <div className="flex-1 min-w-0">
                 <p className="text-xs text-gray-300 truncate">{user.email}</p>
-              </Link>
+              </div>
               <button
                 onClick={handleLogout}
                 className="p-1.5 text-gray-500 hover:text-white hover:bg-[#2a2a2e] rounded transition-colors"
@@ -570,16 +554,31 @@ function ResultsContent() {
                 </span>
               )}
             </div>
-            <div className="flex-1 flex items-center justify-center p-4">
+            <div className="flex-1 flex flex-col items-center justify-center p-4 gap-4">
               {videoUrl ? (
-                <video
-                  controls
-                  autoPlay
-                  className="w-full rounded-lg"
-                  style={{ aspectRatio: '9/16', maxHeight: 'calc(100vh - 10rem)' }}
-                >
-                  <source src={videoUrl} type="video/mp4" />
-                </video>
+                <>
+                  <video
+                    controls
+                    autoPlay
+                    className="w-full rounded-lg"
+                    style={{ aspectRatio: '9/16', maxHeight: 'calc(100vh - 14rem)' }}
+                  >
+                    <source src={videoUrl} type="video/mp4" />
+                  </video>
+                  <a
+                    href={videoUrl}
+                    download="lightfall-video.mp4"
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-white text-[#27272a] rounded-full font-medium text-sm hover:bg-gray-200 transition-colors"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                    Download
+                  </a>
+                  <p className="text-xs text-gray-500 text-center">
+                    Video will be deleted in 30 min or when you create a new video
+                  </p>
+                </>
               ) : (
                 <div
                   className="w-full bg-[#1f1f23] rounded-lg flex items-center justify-center border border-[#2a2a2e]"
@@ -606,35 +605,6 @@ function ResultsContent() {
         </div>
       </div>
 
-      {/* Help button */}
-      <div className="fixed bottom-5 left-5 z-50" ref={helpRef}>
-        <button
-          onClick={() => setIsHelpOpen(!isHelpOpen)}
-          className="w-7 h-7 rounded-full bg-[#3f3f46] hover:bg-[#52525b] flex items-center justify-center text-gray-300 hover:text-white transition-colors text-sm font-medium shadow-lg"
-        >
-          ?
-        </button>
-
-        {/* Help popup */}
-        <div
-          className={`absolute bottom-full left-0 mb-2 bg-[#1f1f23] rounded-2xl shadow-md border border-[#2a2a2e] px-4 py-3 transition-all duration-200 origin-bottom-left ${
-            isHelpOpen
-              ? 'opacity-100 scale-100'
-              : 'opacity-0 scale-95 pointer-events-none'
-          }`}
-        >
-          <p className="text-xs text-gray-500 mb-1">Need help?</p>
-          <a
-            href="mailto:bradshaw.hyrum@gmail.com"
-            className="text-xs text-gray-400 underline inline-flex items-center gap-1 hover:text-gray-300 transition-colors"
-          >
-            bradshaw.hyrum@gmail.com
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-            </svg>
-          </a>
-        </div>
-      </div>
     </div>
   );
 }

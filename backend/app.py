@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
 from sse_starlette.sse import EventSourceResponse
@@ -12,6 +12,7 @@ import time
 import tempfile
 import subprocess
 import uuid
+import shutil
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote_plus
 from dataclasses import dataclass, field
@@ -28,6 +29,9 @@ from config import (
     xai_client,
     ELEVENLABS_AVAILABLE,
     elevenlabs_client,
+    JOB_TTL_SECONDS,
+    CACHE_DIR,
+    cleanup_cache_if_needed,
 )
 
 # Import models
@@ -85,6 +89,7 @@ class JobState:
     job_id: str
     topic: str
     voice_id: str
+    user_ip: str  # Track user by IP for one-job-per-user limit
     created_at: datetime = field(default_factory=datetime.now)
     current_step: str = "pending"
     completed_steps: List[str] = field(default_factory=list)
@@ -96,25 +101,76 @@ class JobState:
     media: Optional[List[Dict]] = None
     final_data: Optional[Dict] = None  # Paused/complete data
     error: Optional[str] = None
+    # Track files created by this job for cleanup
+    created_files: List[str] = field(default_factory=list)
 
 
 # Global job store - maps job_id to JobState
 JOB_STORE: Dict[str, JobState] = {}
 
-# Cleanup old jobs after 1 hour
-JOB_TTL_SECONDS = 3600
+# Track active jobs per user (by IP) - maps IP to job_id
+USER_ACTIVE_JOBS: Dict[str, str] = {}
+
+
+def cleanup_job_files(job: JobState):
+    """Delete all files created by a job."""
+    for file_path in job.created_files:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"  🗑 Deleted job file: {os.path.basename(file_path)}")
+        except OSError:
+            pass
+
+    # Also clean the final video if it exists
+    if job.final_data and job.final_data.get("video_url"):
+        video_url = job.final_data["video_url"]
+        # Convert URL back to file path
+        if "/api/media/" in video_url:
+            parts = video_url.split("/api/media/")[-1].split("/")
+            if len(parts) >= 2:
+                media_type, filename = parts[0], parts[1]
+                file_path = os.path.join(CACHE_DIR, media_type, filename)
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        print(f"  🗑 Deleted final video: {filename}")
+                except OSError:
+                    pass
 
 
 def cleanup_old_jobs():
-    """Remove jobs older than TTL."""
+    """Remove jobs older than TTL and their files."""
     now = datetime.now()
     expired = [
         job_id for job_id, job in JOB_STORE.items()
         if (now - job.created_at).total_seconds() > JOB_TTL_SECONDS
     ]
     for job_id in expired:
+        job = JOB_STORE[job_id]
+        cleanup_job_files(job)
+
+        # Remove from user active jobs
+        if job.user_ip in USER_ACTIVE_JOBS and USER_ACTIVE_JOBS[job.user_ip] == job_id:
+            del USER_ACTIVE_JOBS[job.user_ip]
+
         del JOB_STORE[job_id]
         print(f"🗑 Cleaned up expired job: {job_id}")
+
+    # Also clean disk cache if needed
+    cleanup_cache_if_needed()
+
+
+def cleanup_user_previous_job(user_ip: str):
+    """Clean up a user's previous job when they start a new one."""
+    if user_ip in USER_ACTIVE_JOBS:
+        old_job_id = USER_ACTIVE_JOBS[user_ip]
+        if old_job_id in JOB_STORE:
+            old_job = JOB_STORE[old_job_id]
+            print(f"🗑 Cleaning up previous job {old_job_id} for user {user_ip}")
+            cleanup_job_files(old_job)
+            del JOB_STORE[old_job_id]
+        del USER_ACTIVE_JOBS[user_ip]
 
 
 app = FastAPI()
@@ -208,6 +264,7 @@ async def generate_script(request: ScriptRequest):
 
 @app.get("/api/create-video")
 async def create_video_stream(
+    request: Request,
     topic: str,
     voice_id: str = "nPczCjzI2devNBz1zQrb",
     job_id: Optional[str] = None,
@@ -328,15 +385,23 @@ async def create_video_stream(
                 return
 
         else:
+            # Get user IP for tracking
+            user_ip = request.client.host if request.client else "unknown"
+
+            # Clean up user's previous job (one job per user)
+            cleanup_user_previous_job(user_ip)
+
             # Create new job
             job_id = str(uuid.uuid4())[:8]  # Short ID for convenience
             job = JobState(
                 job_id=job_id,
                 topic=topic,
-                voice_id=voice_id
+                voice_id=voice_id,
+                user_ip=user_ip
             )
             JOB_STORE[job_id] = job
-            print(f"🆕 Created new job {job_id} for topic: {topic[:50]}...")
+            USER_ACTIVE_JOBS[user_ip] = job_id
+            print(f"🆕 Created new job {job_id} for user {user_ip}, topic: {topic[:50]}...")
 
             # Emit job event first
             yield {"event": "job", "data": json.dumps({"job_id": job_id, "reconnected": False})}
