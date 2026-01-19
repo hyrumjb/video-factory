@@ -212,9 +212,11 @@ def clip_from_source(
         encode_cmd = [
             FFMPEG_EXECUTABLE, '-y',
             '-i', temp_clip,
-            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
+            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
             '-b:v', '3000k',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
             '-an',
             output_path
         ]
@@ -254,9 +256,11 @@ def _direct_encode_clip(
             '-ss', str(start_time),
             '-i', source_path,
             '-t', str(duration),
-            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
+            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
             '-b:v', '3000k',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
             '-an',
             output_path
         ]
@@ -528,9 +532,11 @@ def download_youtube_clip(
             FFMPEG_EXECUTABLE, '-y',
             '-t', str(clip_duration),  # Limit input duration (in case download_sections failed)
             '-i', temp_path,
-            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
+            '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
             '-b:v', '3000k',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
             '-an',  # No audio needed for background
             output_path
         ]

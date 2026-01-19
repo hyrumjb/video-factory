@@ -120,56 +120,26 @@ def _process_media_segment(
     """Process a single media segment to the correct duration."""
     try:
         if is_image:
-            # Convert image to video with Ken Burns effect
+            # Convert image to video with simple scale (Ken Burns disabled for memory)
+            # Use simple static image conversion - much more memory efficient
             fps = 30
-            # Use round() to get nearest frame count, add 1 to ensure we have enough frames
-            total_frames = round(duration * fps) + 1
-            zoom_per_frame = 0.12 / max(total_frames, 1)
-
-            zoompan_filter = (
-                f"scale=2160:3840:force_original_aspect_ratio=increase,"
-                f"crop=2160:3840,"
-                f"zoompan=z='min(1+{zoom_per_frame}*on,1.12)':"
-                f"x='iw/2-(iw/zoom/2)':"
-                f"y='ih/2-(ih/zoom/2)':"
-                f"d={total_frames}:"
-                f"s=1080x1920:"
-                f"fps={fps}"
-            )
-
-            cmd = [
+            simple_cmd = [
                 FFMPEG_EXECUTABLE, '-y',
+                '-loop', '1',
                 '-i', str(input_path),
-                '-vf', zoompan_filter,
-                '-t', f'{duration:.3f}',  # Force exact output duration
+                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
                 '-b:v', '3000k',
                 '-pix_fmt', 'yuv420p',
+                '-t', f'{duration:.3f}',
+                '-r', str(fps),
                 '-an',
                 str(output_path)
             ]
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, timeout=120, text=True)
-                return True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                # Fallback: simple image to video
-                simple_cmd = [
-                    FFMPEG_EXECUTABLE, '-y',
-                    '-loop', '1',
-                    '-i', str(input_path),
-                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
-                    '-b:v', '3000k',
-                    '-pix_fmt', 'yuv420p',
-                    '-t', f'{duration:.3f}',
-                    '-r', '30',
-                    '-an',
-                    str(output_path)
-                ]
-                subprocess.run(simple_cmd, check=True, capture_output=True, timeout=90, text=True)
-                return True
+            subprocess.run(simple_cmd, check=True, capture_output=True, timeout=90, text=True)
+            return True
         else:
-            # Trim video to duration
+            # Trim video to duration with consistent format for concatenation
             cmd = [
                 FFMPEG_EXECUTABLE, '-y',
                 '-i', str(input_path),
@@ -177,10 +147,12 @@ def _process_media_segment(
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
                 '-b:v', '3000k',
+                '-pix_fmt', 'yuv420p',
+                '-r', '30',
                 '-an',
                 str(output_path)
             ]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=60, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120, text=True)
             return True
     except Exception as e:
         print(f"      Process error: {e}")
@@ -504,80 +476,45 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
             trimmed_path = temp_path / f"trimmed_video_{i+1}.mp4"
 
             if use_images:
-                # Convert image to video segment with Ken Burns effect (slow zoom in)
+                # Convert image to video segment (simple scale - Ken Burns disabled for memory)
                 fps = 30
-                total_frames = int(scene_duration * fps)
-                # Zoom: start at 1.0, end at ~1.12 (12% zoom over duration)
-                zoom_per_frame = 0.12 / max(total_frames, 1)
-
-                # zoompan filter: z=zoom level, d=total frames, s=output size, fps=frame rate
-                # Scale image to cover output area (force_original_aspect_ratio=increase ensures no distortion)
-                # Then crop to exact size needed for zoompan input
-                zoompan_filter = (
-                    f"scale=2160:3840:force_original_aspect_ratio=increase,"
-                    f"crop=2160:3840,"
-                    f"zoompan=z='min(1+{zoom_per_frame}*on,1.12)':"
-                    f"x='iw/2-(iw/zoom/2)':"
-                    f"y='ih/2-(ih/zoom/2)':"
-                    f"d={total_frames}:"
-                    f"s=1080x1920:"
-                    f"fps={fps}"
-                )
-
-                convert_cmd = [
+                simple_cmd = [
                     FFMPEG_EXECUTABLE, '-y',
+                    '-loop', '1',
                     '-i', str(media_path),
-                    '-vf', zoompan_filter,
+                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
                     '-b:v', '3000k',
                     '-pix_fmt', 'yuv420p',
+                    '-t', f'{scene_duration:.3f}',
+                    '-r', str(fps),
                     '-an',
                     str(trimmed_path)
                 ]
                 try:
-                    # Longer timeout for Ken Burns processing
-                    result = subprocess.run(convert_cmd, check=True, capture_output=True, timeout=120, text=True)
+                    result = subprocess.run(simple_cmd, check=True, capture_output=True, timeout=90, text=True)
                     trimmed_videos.append(trimmed_path)
-                    print(f"✓ Converted image {i+1} to {scene_duration:.2f}s video with Ken Burns")
+                    print(f"✓ Converted image {i+1} to {scene_duration:.2f}s video")
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                     error_msg = getattr(e, 'stderr', '') or str(e)
-                    print(f"⚠ Ken Burns failed, trying simple conversion: {error_msg[:200]}")
-                    # Fallback: simple image to video without zoom effect
-                    # Scale to cover, crop to fit, then convert to video
-                    simple_cmd = [
-                        FFMPEG_EXECUTABLE, '-y',
-                        '-loop', '1',
-                        '-i', str(media_path),
-                        '-vf', f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
-                        '-b:v', '3000k',
-                        '-pix_fmt', 'yuv420p',
-                        '-t', f'{scene_duration:.3f}',
-                        '-r', str(fps),
-                        '-an',
-                        str(trimmed_path)
-                    ]
-                    try:
-                        result = subprocess.run(simple_cmd, check=True, capture_output=True, timeout=90, text=True)
-                        trimmed_videos.append(trimmed_path)
-                        print(f"✓ Converted image {i+1} to {scene_duration:.2f}s video (simple)")
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
-                        error_msg = getattr(e2, 'stderr', '') or str(e2)
-                        print(f"✗ Failed to convert image {i+1}: {error_msg[:200]}")
-                        raise HTTPException(status_code=500, detail=f"Failed to convert image {i+1}")
+                    print(f"✗ Failed to convert image {i+1}: {error_msg[:200]}")
+                    raise HTTPException(status_code=500, detail=f"Failed to convert image {i+1}")
             else:
-                # Trim video to scene duration
+                # Trim video to scene duration with consistent format
                 trim_cmd = [
                     FFMPEG_EXECUTABLE, '-y',
                     '-i', str(media_path),
                     '-t', f'{scene_duration:.3f}',
+                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
                     '-b:v', '3000k',
+                    '-pix_fmt', 'yuv420p',
+                    '-r', '30',
                     '-an',
                     str(trimmed_path)
                 ]
                 try:
-                    result = subprocess.run(trim_cmd, check=True, capture_output=True, timeout=30, text=True)
+                    result = subprocess.run(trim_cmd, check=True, capture_output=True, timeout=120, text=True)
                     trimmed_videos.append(trimmed_path)
                     print(f"✓ Trimmed video {i+1} to {scene_duration:.2f}s")
                 except subprocess.CalledProcessError as e:
@@ -587,41 +524,19 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
         
         # Output video path
         output_path = temp_path / "final_video.mp4"
-        
-        # Step 1: Scale videos to vertical format, then concatenate
+
+        # Concatenate trimmed videos (already scaled to 1080x1920)
         concat_video_path = temp_path / "concatenated.mp4"
 
-        # First, scale each video individually (memory-efficient)
-        scaled_videos = []
-        for i, trimmed_path in enumerate(trimmed_videos):
-            scaled_path = temp_path / f"scaled_{i:03d}.mp4"
-            scale_cmd = [
-                FFMPEG_EXECUTABLE, '-y',
-                '-i', str(trimmed_path),
-                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
-                '-b:v', '3000k',
-                '-an',
-                str(scaled_path)
-            ]
-            try:
-                subprocess.run(scale_cmd, check=True, capture_output=True, timeout=60, text=True)
-                scaled_videos.append(scaled_path)
-            except subprocess.CalledProcessError as e:
-                error_msg = e.stderr if e.stderr else 'Unknown error'
-                print(f"✗ Failed to scale video {i+1}: {error_msg[:200]}")
-                raise HTTPException(status_code=500, detail=f"Failed to scale video {i+1}")
-
-        print(f"✓ Scaled {len(scaled_videos)} videos to vertical format")
-
-        # Then concatenate using concat demuxer (memory-efficient)
-        if len(scaled_videos) == 1:
+        if len(trimmed_videos) == 1:
             import shutil
-            shutil.copy(scaled_videos[0], concat_video_path)
+            shutil.copy(trimmed_videos[0], concat_video_path)
+            print(f"✓ Single video ready")
         else:
+            # Use concat demuxer (memory-efficient)
             concat_list_path = temp_path / "concat_list.txt"
             with open(concat_list_path, 'w') as f:
-                for path in scaled_videos:
+                for path in trimmed_videos:
                     f.write(f"file '{str(path.absolute())}'\n")
 
             concat_cmd = [
@@ -635,7 +550,7 @@ async def compile_video(request: CompileVideoRequest) -> CompileVideoResponse:
 
             try:
                 subprocess.run(concat_cmd, check=True, capture_output=True, timeout=180, text=True)
-                print(f"✓ Concatenated {len(scaled_videos)} videos")
+                print(f"✓ Concatenated {len(trimmed_videos)} videos")
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr if e.stderr else 'Unknown error'
                 print(f"✗ FFmpeg concat error: {error_msg[:500]}")
