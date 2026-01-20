@@ -58,76 +58,71 @@ MIN_HOOK_DURATION = 2.5   # Hooks need at least this much motion
 
 ROUTER_SYSTEM_PROMPT = """You are a visual media routing engine.
 
-Your task is to decide the best media source and generate SIMPLE search queries
-for short-form video clauses.
+Your task is to decide the best media source and generate search queries for short-form video clauses.
 
 You will be given:
 - The overall video topic
 - A batch of narration clauses with timing
 - Each clause's idea_type and duration
 
+MEDIA TYPE PRIORITY (CRITICAL - follow this order):
+1. "youtube_video" - HIGHEST PRIORITY for any real-world topic, person, event, place, animal, or thing that exists
+2. "ai_video" - For dramatic/cinematic shots, abstract concepts, or impossible-to-film visuals
+3. "ai_image" - For artistic/abstract visuals when video isn't needed (duration < 3s)
+4. "web_image" - For real photos of specific things/people when YouTube fails
+5. "stock_video" - LAST RESORT ONLY - use ONLY for extremely generic visuals (clouds, water, typing hands)
+
+WHEN TO USE EACH TYPE:
+- youtube_video: People (celebrities, athletes, politicians), animals, places, events, products, anything REAL
+- ai_video: Fantasy scenes, dramatic cinematic shots, visualizing abstract concepts, historical recreations
+- ai_image: Short artistic moments, abstract ideas, when < 3s duration
+- web_image: Specific real photos needed (products, logos, specific people) when YouTube unavailable
+- stock_video: ONLY for ultra-generic B-roll (hands typing, clouds moving, water flowing) - NEVER for the main topic
+
 CRITICAL - HOOK RULE:
-- The FIRST clause (the hook) MUST always directly show or relate to the main topic
-- For hooks, ALWAYS use youtube_video or web_image with the exact topic as the query
-- Example: If topic is "octopus intelligence", hook query should be "octopus" or "octopus intelligence"
-- Example: If topic is "Napoleon", hook query should be "Napoleon Bonaparte"
-- The hook establishes what the video is about - viewers need to see the topic immediately
+- The FIRST clause (the hook) MUST use youtube_video with the exact topic as query
+- Example: Topic "LeBron James" → hook query "LeBron James"
+- Example: Topic "octopus intelligence" → hook query "octopus"
+- The hook MUST show the actual topic to establish what the video is about
 
-QUERY SIMPLICITY RULES:
-
-For "stock_video" (Pexels/Pixabay):
-- Use ONLY 2-3 generic words describing the visual
-- DO NOT include the topic if it's a proper noun or specific name
-- Examples: "ocean waves", "person thinking", "city night", "forest trees"
-- BAD: "Napoleon Bonaparte battle" → GOOD: "battlefield soldiers"
-- BAD: "Tesla electric car factory" → GOOD: "car factory"
+QUERY RULES:
 
 For "youtube_video":
-- Use the topic + ONE simple detail, max 3-4 words total
-- Examples: "octopus intelligence", "black holes explained", "rome history"
-- Keep it broad enough to find real videos
+- Use the topic name directly, 2-4 words max
+- Examples: "LeBron James", "octopus hunting", "Tesla factory", "ancient Rome"
 
-For "web_image" (Google Images):
-- Use topic + ONE detail, very generic
-- Examples: "octopus", "ancient rome", "electric car"
-- Should find real photos easily
+For "ai_video" and "ai_image":
+- Be EXTREMELY detailed and cinematic
+- Include: subject, action, lighting, mood, camera angle, style
+- Example: "dramatic close-up of basketball player dunking, sweat droplets frozen in air, arena lights flaring, cinematic slow motion"
 
-For "ai_image" and "ai_video":
-- Be EXTREMELY detailed and cinematic - AI generates from your exact description
-- Include: subject, action, lighting, mood, camera angle, style, colors
-- Example: "dramatic close-up of octopus tentacle gripping glass jar, bioluminescent glow, dark ocean background, cinematic lighting, 4K hyperrealistic"
-- Example: "ancient Roman soldiers marching through fog at dawn, golden hour lighting, epic wide shot, dust particles in air, photorealistic"
-- The more vivid and specific, the better the AI output
+For "web_image":
+- Use specific name + context
+- Examples: "LeBron James Lakers", "octopus closeup", "Tesla Model S"
 
-MEDIA TYPE RULES:
-1. Prefer motion (video) over static images for hooks and explanations.
-2. Use realistic footage for real-world facts, animals, concrete subjects.
-3. Use AI-generated visuals only when real footage is impractical.
-4. If duration < 1.8s, strongly prefer images over video.
-5. If duration > 5.5s, prefer video for sustained engagement.
-6. For hooks, always use video if duration >= 2.5s.
+For "stock_video" (LAST RESORT):
+- Use ONLY generic 2-3 word descriptions
+- Examples: "city skyline", "ocean waves", "person walking"
+- NEVER use for the main topic - only for generic filler shots
 
-VARIETY RULE (CRITICAL):
-- NEVER use the same media type for two consecutive clauses
-- Always alternate between different media types
-- Example: stock_video → web_image → stock_video → ai_image (GOOD)
-- Example: stock_video → stock_video → stock_video (BAD - too repetitive)
+VARIETY RULE:
+- Don't use the same media type more than twice in a row
+- Alternate between youtube_video, ai_video, ai_image for variety
+- Example: youtube_video → ai_image → youtube_video → ai_video (GOOD)
 
-Media types:
-- "stock_video": Generic real-world footage (Pexels/Pixabay) - USE GENERIC QUERIES
-- "youtube_video": Real YouTube content - USE TOPIC + ONE DETAIL
-- "web_image": Google Images photos - USE TOPIC + ONE DETAIL
-- "ai_image": AI-generated image (abstract concepts)
-- "ai_video": AI-generated video (impossible shots)
+DURATION RULES:
+- If duration < 2s, prefer images (ai_image or web_image)
+- If duration > 4s, prefer video (youtube_video or ai_video)
+- For hooks, ALWAYS use youtube_video regardless of duration
 
 Output JSON array only, no commentary:
 [
   {
     "clause_id": 1,
-    "media_type": "stock_video",
-    "query": "ocean underwater",
+    "media_type": "youtube_video",
+    "query": "LeBron James dunk",
     "duration": 2.6,
-    "rationale": "Generic underwater footage"
+    "rationale": "Real footage of the topic"
   }
 ]"""
 
@@ -319,13 +314,13 @@ def _enforce_media_variety(instructions: List[MediaInstruction]) -> List[MediaIn
     if len(instructions) < 2:
         return instructions
 
-    # Define alternative types for each media type
+    # Define alternative types for each media type (AI preferred over stock)
     alternatives = {
-        MediaType.STOCK_VIDEO: [MediaType.WEB_IMAGE, MediaType.AI_IMAGE],
-        MediaType.YOUTUBE_VIDEO: [MediaType.STOCK_VIDEO, MediaType.WEB_IMAGE],
-        MediaType.WEB_IMAGE: [MediaType.STOCK_VIDEO, MediaType.AI_IMAGE],
-        MediaType.AI_IMAGE: [MediaType.WEB_IMAGE, MediaType.STOCK_VIDEO],
-        MediaType.AI_VIDEO: [MediaType.STOCK_VIDEO, MediaType.WEB_IMAGE],
+        MediaType.STOCK_VIDEO: [MediaType.AI_IMAGE, MediaType.WEB_IMAGE],
+        MediaType.YOUTUBE_VIDEO: [MediaType.AI_IMAGE, MediaType.AI_VIDEO, MediaType.WEB_IMAGE],
+        MediaType.WEB_IMAGE: [MediaType.AI_IMAGE, MediaType.YOUTUBE_VIDEO],
+        MediaType.AI_IMAGE: [MediaType.YOUTUBE_VIDEO, MediaType.WEB_IMAGE],
+        MediaType.AI_VIDEO: [MediaType.YOUTUBE_VIDEO, MediaType.AI_IMAGE],
     }
 
     changes_made = 0
@@ -721,7 +716,8 @@ def _get_video_duration(media_url: str) -> Optional[float]:
 
 
 # Fallback media types in priority order
-FALLBACK_TYPES = [MediaType.STOCK_VIDEO, MediaType.WEB_IMAGE, MediaType.AI_IMAGE]
+# Fallback order: AI first, then web images, stock video as absolute last resort
+FALLBACK_TYPES = [MediaType.AI_IMAGE, MediaType.WEB_IMAGE, MediaType.STOCK_VIDEO]
 
 
 async def _get_replacement_media(

@@ -148,6 +148,7 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
             "no_warnings": True,
             "outtmpl": output_template,
             "noprogress": True,  # Avoid progress bar issues
+            "extractor_args": {"youtube": {"player_client": ["web"]}},  # Use web client to avoid JS issues
         }
 
         try:
@@ -505,6 +506,7 @@ def download_youtube_clip(
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "extractor_args": {"youtube": {"player_client": ["web"]}},  # Use web client to avoid JS issues
         }
 
         stream_url = None
