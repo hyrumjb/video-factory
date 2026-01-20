@@ -93,11 +93,17 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
     """
     global _downloaded_sources
 
+    MAX_SOURCE_SIZE_MB = 100  # Reject sources larger than this (memory constraint)
+
     # Check cache first (in-memory)
     if video_id in _downloaded_sources:
         cached_path = _downloaded_sources[video_id]
         if os.path.exists(cached_path) and os.path.getsize(cached_path) > 0:
             file_size_mb = os.path.getsize(cached_path) / (1024 * 1024)
+            if file_size_mb > MAX_SOURCE_SIZE_MB:
+                print(f"      ✗ Cached source too large ({file_size_mb:.1f} MB > {MAX_SOURCE_SIZE_MB} MB)")
+                del _downloaded_sources[video_id]
+                return None
             print(f"      ✓ Cache hit: {video_id} ({file_size_mb:.1f} MB)")
             return cached_path
         else:
@@ -109,6 +115,14 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
         disk_path = os.path.join(cache_dir, f"source_{video_id}{ext}")
         if os.path.exists(disk_path) and os.path.getsize(disk_path) > 0:
             file_size_mb = os.path.getsize(disk_path) / (1024 * 1024)
+            if file_size_mb > MAX_SOURCE_SIZE_MB:
+                print(f"      ✗ Cached source too large ({file_size_mb:.1f} MB > {MAX_SOURCE_SIZE_MB} MB)")
+                # Remove oversized cached file to free disk space
+                try:
+                    os.remove(disk_path)
+                except:
+                    pass
+                return None
             print(f"      ✓ Disk cache hit: {video_id} ({file_size_mb:.1f} MB)")
             _downloaded_sources[video_id] = disk_path
             return disk_path
@@ -160,6 +174,16 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
             path = os.path.join(cache_dir, f"source_{video_id}{ext}")
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 file_size_mb = os.path.getsize(path) / (1024 * 1024)
+
+                # Check size limit
+                if file_size_mb > MAX_SOURCE_SIZE_MB:
+                    print(f"      ✗ Downloaded source too large ({file_size_mb:.1f} MB > {MAX_SOURCE_SIZE_MB} MB)")
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+                    return None
+
                 print(f"      ✓ Downloaded: {video_id} ({file_size_mb:.1f} MB)")
                 _downloaded_sources[video_id] = path
                 return path
@@ -449,7 +473,10 @@ def download_youtube_clip(
     video_duration: Optional[float] = None
 ) -> Optional[str]:
     """
-    Download a short clip from YouTube (optimized for speed).
+    Download a short clip from YouTube using ffmpeg streaming.
+
+    Uses yt-dlp to get the stream URL, then ffmpeg to download only
+    the specific section needed. This is more reliable than download_sections.
 
     Args:
         video_url: YouTube video URL
@@ -467,92 +494,69 @@ def download_youtube_clip(
         return None
 
     try:
-        # Create temp directory for download
-        temp_dir = tempfile.mkdtemp(prefix="ytdl_")
-        temp_template = os.path.join(temp_dir, "video.%(ext)s")
-
         # Calculate smart start time to skip intros
         start = pick_start_time(video_duration, clip_duration)
-        end = start + clip_duration
 
-        print(f"      Downloading from {video_url[:50]}... (t={start:.0f}s-{end:.0f}s)")
+        print(f"      Streaming clip: t={start:.0f}s, duration={clip_duration:.0f}s...")
 
-        # yt-dlp options - prioritize speed over quality
-        # Force 480p max - these are just background clips, quality doesn't matter
+        # Step 1: Get the direct stream URL using yt-dlp (no download)
         ydl_opts = {
-            "format": "bv*[height<=480]/bv*[height<=720]/worst",  # Prefer 480p, fallback to 720p, worst case take anything
-            "download_sections": [f"*{start}-{end}"],
-            "concurrent_fragment_downloads": 8,
+            "format": "bv*[height<=480][ext=mp4]/bv*[height<=480]/bv*[height<=720][ext=mp4]/bv*[height<=720]/worst",
             "noplaylist": True,
-            "writesubtitles": False,
-            "writethumbnail": False,
             "quiet": True,
             "no_warnings": True,
-            "outtmpl": temp_template,
         }
 
+        stream_url = None
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+            info = ydl.extract_info(video_url, download=False)
+            if info:
+                stream_url = info.get('url')
+                # If no direct URL, try to get from formats
+                if not stream_url and info.get('formats'):
+                    # Find best matching format
+                    for fmt in reversed(info['formats']):
+                        if fmt.get('url') and fmt.get('vcodec') != 'none':
+                            height = fmt.get('height', 0)
+                            if height and height <= 720:
+                                stream_url = fmt['url']
+                                break
+                    # Fallback to any video format
+                    if not stream_url:
+                        for fmt in reversed(info['formats']):
+                            if fmt.get('url') and fmt.get('vcodec') != 'none':
+                                stream_url = fmt['url']
+                                break
 
-        # Find the downloaded file in temp directory
-        temp_path = None
-        if os.path.exists(temp_dir):
-            files = os.listdir(temp_dir)
-            for f in files:
-                if f.endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
-                    temp_path = os.path.join(temp_dir, f)
-                    break
-
-        if not temp_path or not os.path.exists(temp_path):
-            print("      ✗ Download failed: No file downloaded")
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if not stream_url:
+            print("      ✗ Could not get stream URL")
             return None
 
-        # Check file size and get duration
-        file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-        print(f"      ✓ Downloaded: {os.path.basename(temp_path)} ({file_size_mb:.1f} MB)")
-
-        # Get actual duration of downloaded file
-        try:
-            actual_duration = get_media_duration(temp_path)
-            print(f"      Actual duration: {actual_duration:.1f}s")
-
-            # If file is way longer than expected, warn
-            if actual_duration > clip_duration * 2:
-                print(f"      ⚠ File is {actual_duration:.0f}s but we only need {clip_duration:.0f}s - will trim")
-        except Exception:
-            actual_duration = clip_duration  # Assume it's correct
-
-        print("      Converting to vertical format...")
-
-        # Convert to vertical format (letterbox style)
-        # Use libx264 with ultrafast preset for low memory usage
-        # Limit to clip_duration to handle cases where download_sections didn't work
-        convert_cmd = [
+        # Step 2: Use ffmpeg to download only the section we need
+        # -ss before -i for fast seeking (input seeking)
+        ffmpeg_cmd = [
             FFMPEG_EXECUTABLE, '-y',
-            '-t', str(clip_duration),  # Limit input duration (in case download_sections failed)
-            '-i', temp_path,
+            '-ss', str(start),
+            '-i', stream_url,
+            '-t', str(clip_duration),
             '-vf', 'scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
             '-b:v', '3000k',
             '-pix_fmt', 'yuv420p',
             '-r', '30',
-            '-an',  # No audio needed for background
+            '-an',
             output_path
         ]
 
-        convert_result = subprocess.run(
-            convert_cmd,
+        result = subprocess.run(
+            ffmpeg_cmd,
             capture_output=True,
             text=True,
-            timeout=180  # 3 minutes should be plenty for 30s clip
+            timeout=120  # 2 minutes should be enough for streaming a short clip
         )
 
-        # Clean up temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-        if convert_result.returncode != 0 or not os.path.exists(output_path):
-            stderr_lines = convert_result.stderr.split('\n')
+        if result.returncode != 0 or not os.path.exists(output_path):
+            stderr_lines = result.stderr.split('\n') if result.stderr else []
             error_lines = [line for line in stderr_lines if 'error' in line.lower() or 'invalid' in line.lower()]
             if error_lines:
                 print(f"      ✗ Convert failed: {' | '.join(error_lines[:3])}")
@@ -561,9 +565,12 @@ def download_youtube_clip(
             return None
 
         output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"      ✓ Converted clip ({output_size_mb:.1f} MB)")
+        print(f"      ✓ Created clip ({output_size_mb:.1f} MB)")
         return output_path
 
+    except subprocess.TimeoutExpired:
+        print("      ✗ Stream timeout (video may be geo-restricted or slow)")
+        return None
     except Exception as e:
         print(f"      ✗ Download error: {e}")
         return None
