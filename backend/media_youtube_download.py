@@ -16,6 +16,38 @@ from config import xai_client, FFMPEG_EXECUTABLE, XAI_MODEL, get_media_duration
 # Persistent cache directory (survives across runs)
 _CACHE_BASE = os.path.join(os.path.dirname(__file__), "youtube_cache")
 
+# Cookie file for YouTube authentication (bypasses bot detection)
+_COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
+
+def _check_ffmpeg() -> bool:
+    """Check if FFmpeg is available in system PATH."""
+    try:
+        result = subprocess.run(
+            [FFMPEG_EXECUTABLE, '-version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return False
+
+
+def _get_cookiefile() -> Optional[str]:
+    """Get the cookie file path if it exists."""
+    if os.path.exists(_COOKIES_FILE):
+        return _COOKIES_FILE
+    return None
+
+
+# Check FFmpeg on module load
+if not _check_ffmpeg():
+    print("⚠ CRITICAL: FFmpeg not found in system PATH!")
+    print("  → Railway/Nixpacks: Add 'ffmpeg' to nixPkgs in nixpacks.toml")
+    print("  → Docker: Add 'RUN apt-get install -y ffmpeg' to Dockerfile")
+    print("  → Local: Install FFmpeg via your package manager")
+
 # Cache of downloaded source videos: video_id -> local file path
 _downloaded_sources: Dict[str, str] = {}
 
@@ -139,8 +171,10 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
         print(f"      Downloading source: {video_id}...")
 
         ydl_opts = {
-            "format": "bv*[height<=480]/bv*[height<=720]/worst",
-            "concurrent_fragment_downloads": 8,
+            # Use mp4 container to avoid heavy merging (Railway RAM constraint)
+            "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/mp4/best[height<=720]",
+            "merge_output_format": "mp4",
+            "concurrent_fragment_downloads": 4,  # Reduced for Railway memory
             "noplaylist": True,
             "writesubtitles": False,
             "writethumbnail": False,
@@ -148,8 +182,14 @@ def download_source_video(video_url: str, video_id: str) -> Optional[str]:
             "no_warnings": True,
             "outtmpl": output_template,
             "noprogress": True,  # Avoid progress bar issues
-            "extractor_args": {"youtube": {"player_client": ["web"]}},  # Use web client to avoid JS issues
+            "extractor_args": {"youtube": {"player_client": ["web"]}},
+            "impersonate": "chrome",  # Mimic Chrome browser headers
         }
+
+        # Add cookies if available (bypasses bot detection on Railway IPs)
+        cookiefile = _get_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -408,7 +448,15 @@ def search_youtube(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
             '--dump-json',
             '--no-download',
             '--no-playlist',
+            '--no-warnings',
+            '--extractor-args', 'youtube:player_client=web',
+            '--impersonate', 'chrome',  # Mimic Chrome browser headers
         ]
+
+        # Add cookies if available (bypasses bot detection)
+        cookiefile = _get_cookiefile()
+        if cookiefile:
+            cmd.extend(['--cookies', cookiefile])
 
         result = subprocess.run(
             cmd,
@@ -418,8 +466,15 @@ def search_youtube(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         )
 
         # Check for actual errors (not just warnings)
+        # If we have results in stdout, use them even if returncode is non-zero (warnings are OK)
         if result.returncode != 0 and not result.stdout.strip():
-            print(f"⚠ yt-dlp search failed: {result.stderr[:200]}")
+            # Extract the actual error message, ignoring "WARNING:" lines
+            error_lines = [line for line in result.stderr.split('\n')
+                          if line.strip() and not line.strip().startswith('WARNING')]
+            if error_lines:
+                print(f"⚠ yt-dlp search failed: {' '.join(error_lines[:2])[:200]}")
+            else:
+                print(f"⚠ yt-dlp search failed (returncode {result.returncode})")
             return []
 
         videos = []
@@ -502,12 +557,19 @@ def download_youtube_clip(
 
         # Step 1: Get the direct stream URL using yt-dlp (no download)
         ydl_opts = {
-            "format": "bv*[height<=480][ext=mp4]/bv*[height<=480]/bv*[height<=720][ext=mp4]/bv*[height<=720]/worst",
+            # Use mp4 container to avoid heavy merging (Railway RAM constraint)
+            "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/mp4/best[height<=720]",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "extractor_args": {"youtube": {"player_client": ["web"]}},  # Use web client to avoid JS issues
+            "extractor_args": {"youtube": {"player_client": ["web"]}},
+            "impersonate": "chrome",  # Mimic Chrome browser headers
         }
+
+        # Add cookies if available (bypasses bot detection on Railway IPs)
+        cookiefile = _get_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
 
         stream_url = None
         with YoutubeDL(ydl_opts) as ydl:
@@ -836,7 +898,7 @@ async def download_single_youtube_clip(
     # Search YouTube
     videos = search_youtube(query, max_results=5)
 
-    # Filter to longer videos
+    # Filter to longer videos (prefer 90s+ for better b-roll)
     long_videos = [v for v in videos if v.get('duration', 0) >= 90]
     if not long_videos:
         long_videos = videos
@@ -845,56 +907,59 @@ async def download_single_youtube_clip(
         print(f"   ⚠ No YouTube videos found for: {query}")
         return None
 
-    video = long_videos[0]
-    video_id = _extract_video_id(video['url']) or video.get('id')
-
-    if not video_id:
-        print(f"   ⚠ Could not extract video ID")
-        return None
-
-    # Download source if not cached
+    # Try each video until one works
     sem = _get_semaphore()
-    async with sem:
-        source_path = await asyncio.to_thread(download_source_video, video['url'], video_id)
-
-    if not source_path:
-        print(f"   ⚠ Failed to download YouTube source")
-        return None
-
-    # Create clip from source
     output_dir = _get_cache_dir()
-    output_filename = f"yt_clip_{video_id}_{int(target_duration)}s.mp4"
-    output_path = os.path.join(output_dir, output_filename)
 
-    # If clip already exists, return it
-    if os.path.exists(output_path):
-        print(f"   ✓ Using cached clip: {output_filename}")
-        return {
-            "video_path": output_path,
-            "video_title": video.get('title', ''),
-            "video_url": video.get('url', '')
-        }
+    for video in long_videos:
+        video_id = _extract_video_id(video['url']) or video.get('id')
 
-    # Get source duration and pick start time
-    video_duration = video.get('duration', 300)
-    start_time = pick_start_time(video_duration, target_duration)
+        if not video_id:
+            continue
 
-    async with sem:
-        result = await asyncio.to_thread(
-            clip_from_source,
-            source_path,
-            output_path,
-            start_time,
-            target_duration
-        )
+        output_filename = f"yt_clip_{video_id}_{int(target_duration)}s.mp4"
+        output_path = os.path.join(output_dir, output_filename)
 
-    if result:
-        return {
-            "video_path": result,
-            "video_title": video.get('title', ''),
-            "video_url": video.get('url', '')
-        }
+        # If clip already exists, return it
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"   ✓ Using cached clip: {output_filename}")
+            return {
+                "video_path": output_path,
+                "video_title": video.get('title', ''),
+                "video_url": video.get('url', '')
+            }
 
+        # Download source if not cached
+        async with sem:
+            source_path = await asyncio.to_thread(download_source_video, video['url'], video_id)
+
+        if not source_path:
+            print(f"      Trying next video...")
+            continue
+
+        # Get source duration and pick start time
+        video_duration = video.get('duration', 300)
+        start_time = pick_start_time(video_duration, target_duration)
+
+        async with sem:
+            result = await asyncio.to_thread(
+                clip_from_source,
+                source_path,
+                output_path,
+                start_time,
+                target_duration
+            )
+
+        if result:
+            return {
+                "video_path": result,
+                "video_title": video.get('title', ''),
+                "video_url": video.get('url', '')
+            }
+
+        print(f"      Clip failed, trying next video...")
+
+    print(f"   ⚠ All {len(long_videos)} videos failed for: {query}")
     return None
 
 

@@ -1,8 +1,9 @@
 # Nixpacks configuration for Railway
 # Adds Node.js for yt-dlp JavaScript runtime support
+# Adds FFmpeg for video processing (required by yt-dlp for merging)
 
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "ffmpeg"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]

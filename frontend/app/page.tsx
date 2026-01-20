@@ -25,8 +25,10 @@ export default function Home() {
   const [isSelectOpen, setIsSelectOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [inputMode, setInputMode] = useState<'idea' | 'script'>('idea');
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const selectRef = useRef<HTMLDivElement>(null);
   const helpRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const router = useRouter();
   const { user, loading } = useAuth();
 
@@ -50,6 +52,22 @@ export default function Home() {
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Video plays on mouse move, doesn't restart if already playing
+  useEffect(() => {
+    const handleMouseMove = () => {
+      if (!isVideoPlaying && videoRef.current) {
+        videoRef.current.play();
+        setIsVideoPlaying(true);
+      }
+    };
+    document.addEventListener('mousemove', handleMouseMove);
+    return () => document.removeEventListener('mousemove', handleMouseMove);
+  }, [isVideoPlaying]);
+
+  const handleVideoEnded = () => {
+    setIsVideoPlaying(false);
+  };
 
   const voices = [
     { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian', description: 'Male, American, narration' },
@@ -152,9 +170,22 @@ export default function Home() {
   const selectedVoiceData = voices.find(v => v.id === selectedVoice);
 
   return (
-    <div className="h-screen bg-[#27272a] flex flex-col overflow-hidden">
+    <div className="h-screen bg-[#27272a] flex flex-col overflow-hidden relative">
+      {/* Video Background */}
+      <video
+        ref={videoRef}
+        muted
+        playsInline
+        onEnded={handleVideoEnded}
+        className="absolute inset-0 w-full h-full object-cover z-0"
+      >
+        <source src="/background.mp4" type="video/mp4" />
+      </video>
+      {/* Dark overlay for readability */}
+      <div className="absolute inset-0 bg-black/60 z-0" />
+
       {/* Header */}
-      <header className="px-6 py-4 flex items-center justify-between">
+      <header className="px-6 py-4 flex items-center justify-between relative z-10">
         <Link href="/" className="text-2xl font-semibold text-white logo-text">
           Lightfall
         </Link>
@@ -201,25 +232,8 @@ export default function Home() {
       </header>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col items-center justify-start pt-8 md:pt-16 px-6">
-        <div className="w-full max-w-7xl flex items-center justify-center gap-16 lg:gap-28">
-          {/* Left iPhone mockup - hidden on small screens */}
-          <div className="hidden lg:block flex-shrink-0">
-            <div className="iphone-frame">
-              <div className="iphone-notch" />
-              <video
-                src="/sample1.mp4"
-                autoPlay
-                loop
-                muted
-                playsInline
-                className="iphone-video"
-              />
-            </div>
-          </div>
-
-          {/* Center content */}
-          <div className="w-full max-w-xl space-y-8">
+      <main className="flex-1 flex flex-col items-center justify-start pt-36 px-6 relative z-10">
+        <div className="w-full max-w-xl space-y-8">
             <h1 className="text-4xl md:text-5xl font-semibold text-center tracking-tight text-white">
               Create beautiful videos with zero effort
             </h1>
@@ -329,27 +343,11 @@ export default function Home() {
               </div>
             </div>
           </form>
-          </div>
-
-          {/* Right iPhone mockup - hidden on small screens */}
-          <div className="hidden lg:block flex-shrink-0">
-            <div className="iphone-frame">
-              <div className="iphone-notch" />
-              <video
-                src="/sample2.mp4"
-                autoPlay
-                loop
-                muted
-                playsInline
-                className="iphone-video"
-              />
-            </div>
-          </div>
         </div>
       </main>
 
       {/* Help button */}
-      <div className="fixed bottom-5 left-5" ref={helpRef}>
+      <div className="fixed bottom-5 left-5 z-10" ref={helpRef}>
         <button
           onClick={() => setIsHelpOpen(!isHelpOpen)}
           className="w-7 h-7 rounded-full bg-[#3f3f46] hover:bg-[#52525b] flex items-center justify-center text-gray-300 hover:text-white transition-colors text-sm font-medium shadow-lg"
